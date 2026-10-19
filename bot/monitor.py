@@ -1,4 +1,4 @@
-"""Основной цикл: дневная цель от баланса на 00:00 (МСК) и закрытие позиций после её достижения."""
+"""Основной цикл: дневная цель от базы дня (00:00 МСК) и закрытие позиций после её достижения."""
 from __future__ import annotations
 
 import logging
@@ -25,11 +25,10 @@ class Bot:
         self.closer = closer or PositionCloser(client, cfg)
         self.tz = get_tz(cfg.timezone)
         self.clock = clock or (lambda: datetime.now(self.tz))
-        self._fee_cache: dict[str, tuple[float, float]] = {}
         self.tracker = DayPnlTracker(client, cfg)
-        self._last_realized = 0.0
+        self._fee_cache: dict[str, tuple[float, float]] = {}
         self._rr = 0
-        self._pending_final = False  # были позиции, закрываемые после цели — нужно записать итог дня
+        self._pending_final = False  # закрывали позиции после цели — нужно записать итог дня
         self.closing = False
 
     # ---------- вспомогательное ----------
@@ -40,8 +39,10 @@ class Bot:
             self._fee_cache[symbol] = (time.time(), fee)
         return fee
 
-    def _ensure_day(self, equity: float, unrealised: float) -> dict:
-        now = self.clock()
+    def _now_ms(self, now: datetime) -> int:
+        return int(now.timestamp() * 1000) + int(getattr(self.client, "time_offset_ms", 0))
+
+    def _ensure_day(self, now: datetime, equity: float, unrealised: float) -> dict:
         day = now.date().isoformat()
         row = self.store.get_day(day)
         if row:
@@ -51,13 +52,34 @@ class Bot:
         elif now.hour == 0 and now.minute < 5:
             kind = "midnight"
         else:
-            kind = "late_start"  # бот был выключен в полночь — база = баланс на момент старта
-        self.store.create_day(day, equity, unrealised, now.isoformat(), kind, self.cfg.target_profit_pct)
-        self.store.add_event(day, now.isoformat(), "day_start", f"{kind}: база дня {equity:.4f}, нереализованный {unrealised:.4f}")
+            kind = "late_start"  # бот был выключен в полночь
+
+        start_ts, start_equity, note = now.isoformat(), equity, ""
+        if kind != "midnight":
+            # Бот стартовал днём: восстанавливаем базу на 00:00 по логу транзакций, чтобы учесть уже сделанное за день.
+            midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            try:
+                rows = self.client.get_transaction_log(
+                    self.cfg.account_type, None, self.cfg.settle_coin,
+                    int(midnight.timestamp() * 1000), self._now_ms(now) + 60_000)
+                total = sum(float(r.get("change") or 0) for r in rows
+                            if r.get("currency", self.cfg.settle_coin) == self.cfg.settle_coin
+                            and int(r.get("transactionTime") or 0) >= int(midnight.timestamp() * 1000))
+                est = equity - total
+                if est > 0:
+                    start_equity, start_ts = est, midnight.isoformat()
+                    note = (f"; база восстановлена на 00:00 (баланс {equity:.4f} − изменения счёта за день {total:+.4f}); "
+                            f"нереализованный PnL открытых позиций на 00:00 неизвестен — считаем только его дальнейшее изменение")
+            except Exception:
+                log.exception("Не удалось восстановить базу на 00:00 — берём текущий баланс")
+
+        self.store.create_day(day, start_equity, unrealised, start_ts, kind, self.cfg.target_profit_pct)
+        self.store.add_event(day, now.isoformat(), "day_start",
+                             f"{kind}: база дня {start_equity:.4f}, нереализованный {unrealised:.4f}{note}")
         log.warning("Новый день %s: база (баланс) = %.4f USDT, нереализованный PnL на старте = %+.4f [%s]. "
-                    "Цель +%.2f%% = %+.4f USDT результата за день",
-                    day, equity, unrealised, kind, self.cfg.target_profit_pct,
-                    equity * self.cfg.target_profit_pct / 100)
+                    "Цель +%.2f%% = %+.4f USDT результата за день%s",
+                    day, start_equity, unrealised, kind, self.cfg.target_profit_pct,
+                    start_equity * self.cfg.target_profit_pct / 100, note)
         self._pending_final = False
         return self.store.get_day(day)
 
@@ -65,33 +87,30 @@ class Bot:
     def step(self) -> Evaluation:
         cfg = self.cfg
         now = self.clock()
+        row = self.store.get_day(now.date().isoformat())
+        if row and row["goal_reached"]:
+            return self._goal_step(row, now)   # цель уже в БД — лог транзакций и баланс больше не запрашиваем
+
         equity = self.client.get_equity(cfg.account_type)
         positions = [parse_position(r) for r in self.client.get_positions(cfg.category, cfg.settle_coin)]
-        day = self._ensure_day(equity, sum(p.unrealised_pnl for p in positions))
+        day = self._ensure_day(now, equity, sum(p.unrealised_pnl for p in positions))
 
         books = {s: self.client.get_orderbook(cfg.category, s, cfg.book_limit)
                  for s in {p.symbol for p in positions}}
         fees = {s: self._taker_fee(s) for s in books}
 
         start_ms = int(datetime.fromisoformat(day["start_ts"]).timestamp() * 1000)
-        now_ms = int(now.timestamp() * 1000) + int(getattr(self.client, "time_offset_ms", 0))
-        goal = bool(day["goal_reached"])
-        try:
-            self._last_realized = self.tracker.realized(day["day"], start_ms, now_ms)
-        except Exception:
-            if not goal:
-                raise  # без данных не решаем, достигнута ли цель
-            log.exception("Не удалось обновить лог транзакций — цель уже достигнута, продолжаем закрытие")
-        ev = evaluate(day["start_equity"], day["start_unrealised"], self._last_realized,
+        realized = self.tracker.realized(day["day"], start_ms, self._now_ms(now))  # при ошибке — без решения
+        ev = evaluate(day["start_equity"], day["start_unrealised"], realized,
                       positions, books, fees, cfg.slippage_buffer_bps, equity)
 
-        if not goal and ev.pct >= cfg.target_profit_pct:
+        goal = ev.pct >= cfg.target_profit_pct
+        if goal:
             self.store.mark_goal(day["day"], now.isoformat(), equity, ev.gain, ev.pct)
             self.store.add_event(day["day"], now.isoformat(), "goal",
                                  f"цель достигнута: {ev.gain:+.4f} USDT = {ev.pct:.3f}% от базы {ev.start_equity:.4f}")
-            goal = True
             log.warning("ЦЕЛЬ ДНЯ ДОСТИГНУТА: результат %+.4f USDT = %.3f%% >= %.2f%% (база %.4f). "
-                        "Закрываем все позиции и все новые до конца дня.%s",
+                        "Записано в БД. Закрываем все позиции и все новые до конца дня.%s",
                         ev.gain, ev.pct, cfg.target_profit_pct, ev.start_equity,
                         " [DRY-RUN: ордера не отправляются]" if cfg.dry_run else "")
         ev.goal = goal
@@ -105,14 +124,44 @@ class Bot:
         if goal and positions:
             self._pending_final = True
             self._close_one_chunk(positions, books)
-        elif goal and not positions and self._pending_final:
-            self.store.set_final(day["day"], now.isoformat(), equity, ev.gain)
-            self.store.add_event(day["day"], now.isoformat(), "final",
-                                 f"все позиции закрыты, результат дня {ev.gain:+.4f} USDT ({ev.pct:+.3f}%), баланс {equity:.4f}")
-            log.warning("Все позиции закрыты. Итог дня: %+.4f USDT (%+.3f%% от базы %.4f), баланс %.4f.",
-                        ev.gain, ev.pct, ev.start_equity, equity)
-            self._pending_final = False
         return ev
+
+    def _goal_step(self, row: dict, now: datetime) -> Evaluation:
+        """Цель дня уже выполнена: только позиции и закрытие. Ни лога транзакций, ни баланса."""
+        cfg = self.cfg
+        positions = [parse_position(r) for r in self.client.get_positions(cfg.category, cfg.settle_coin)]
+        ev = Evaluation(start_equity=row["start_equity"], gain=row["goal_gain"] or 0.0,
+                        pct=row["goal_pct"] or 0.0, goal=True)
+        if positions:
+            books = {s: self.client.get_orderbook(cfg.category, s, cfg.book_limit)
+                     for s in {p.symbol for p in positions}}
+            self.closing = True
+            self._pending_final = True
+            log.info("%s | цель дня выполнена — закрываем позиции (%d)", row["day"], len(positions))
+            self._close_one_chunk(positions, books)
+            return ev
+        self.closing = False
+        if self._pending_final:
+            self._record_final(row, now)
+        else:
+            log.info("%s | цель дня выполнена, позиций нет — ждём до 00:00", row["day"])
+        return ev
+
+    def _record_final(self, row: dict, now: datetime) -> None:
+        equity = self.client.get_equity(self.cfg.account_type)
+        gain = None
+        try:
+            start_ms = int(datetime.fromisoformat(row["start_ts"]).timestamp() * 1000)
+            gain = self.tracker.realized(row["day"], start_ms, self._now_ms(now))
+        except Exception:
+            log.exception("Не удалось получить итоговый результат дня из лога транзакций")
+        self.store.set_final(row["day"], now.isoformat(), equity, gain)
+        txt = f"{gain:+.4f} USDT" if gain is not None else "н/д"
+        self.store.add_event(row["day"], now.isoformat(), "final",
+                             f"все позиции закрыты, результат дня {txt}, баланс {equity:.4f}")
+        log.warning("Все позиции закрыты. Итог дня: %s (цель была %.2f%%), баланс %.4f.",
+                    txt, self.cfg.target_profit_pct, equity)
+        self._pending_final = False
 
     def _close_one_chunk(self, positions: list[PositionView], books: dict[str, dict]) -> None:
         ordered = sorted(positions, key=lambda p: p.key)

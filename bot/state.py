@@ -65,13 +65,21 @@ class StateStore:
                 "INSERT OR IGNORE INTO days(day,start_equity,start_unrealised,start_ts,start_kind,target_pct) "
                 "VALUES(?,?,?,?,?,?)", (day, equity, unrealised, ts, kind, target_pct))
 
+    def delete_day(self, day: str) -> bool:
+        """Сбросить день (строка дня удаляется, при следующем шаге база пересчитается)."""
+        with self.conn:
+            n = self.conn.execute("DELETE FROM days WHERE day=?", (day,)).rowcount
+            self.conn.execute("INSERT INTO events(ts,day,kind,text) VALUES(datetime('now'),?,?,?)",
+                              (day, "reset", "день сброшен вручную"))
+        return n > 0
+
     def mark_goal(self, day: str, ts: str, equity: float, gain: float, pct: float) -> None:
         with self.conn:
             self.conn.execute(
                 "UPDATE days SET goal_reached=1, goal_ts=?, goal_equity=?, goal_gain=?, goal_pct=? WHERE day=?",
                 (ts, equity, gain, pct, day))
 
-    def set_final(self, day: str, ts: str, equity: float, gain: float) -> None:
+    def set_final(self, day: str, ts: str, equity: float, gain: float | None) -> None:
         with self.conn:
             self.conn.execute("UPDATE days SET final_equity=?, final_gain=?, final_ts=? WHERE day=?",
                               (equity, gain, ts, day))

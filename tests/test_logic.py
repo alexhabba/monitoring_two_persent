@@ -116,9 +116,9 @@ class FakeClient:
         self.realized += amount
         self._log(typ, amount, ts_ms)
 
-    def deposit(self, amount):
+    def deposit(self, amount, ts_ms=None):
         self.transfers += amount
-        self._log("TRANSFER_IN" if amount > 0 else "TRANSFER_OUT", amount)
+        self._log("TRANSFER_IN" if amount > 0 else "TRANSFER_OUT", amount, ts_ms)
 
     def get_transaction_log(self, account_type, category, currency, start_ms, end_ms):
         self.tx_calls += 1
@@ -376,12 +376,75 @@ def test_unrealised_at_day_start_is_not_counted_as_todays_profit(tmp_path):
     assert ev.pct >= 2.0
 
 
-def test_trades_before_day_start_are_ignored(tmp_path):
-    cl = FakeClient()
+def _ms(h, m=0, day=19):
+    return int(datetime(2026, 10, day, h, m, tzinfo=MSK).timestamp() * 1000)
+
+
+def test_first_run_midday_counts_todays_earlier_trades_and_latches_goal(tmp_path):
+    cl = FakeClient(legs={0: ["Buy", 0.0, 100.0]})          # позиций сейчас нет
     bot, store, clock = make_bot(cl, tmp_path)
-    cl.add_realized(50.0, ts_ms=int(datetime(2026, 10, 19, 3, 0, tzinfo=MSK).timestamp() * 1000))
-    bot.step()                      # первый запуск в 14:00: вчерашнее/утреннее не считается
-    assert bot.step().realized == 0.0
+    cl.add_realized(15.0, ts_ms=_ms(3))                      # утром уже заработали +15 при базе ~500
+    ev = bot.step()                                          # первый запуск в 14:00
+    row = store.get_day("2026-10-19")
+    assert abs(row["start_equity"] - 500.0) < 1e-9           # база восстановлена: 515 − 15
+    assert row["start_ts"].startswith("2026-10-19T00:00:00")
+    assert row["goal_reached"] == 1 and abs(row["goal_gain"] - 15.0) < 1e-9 and ev.goal
+
+
+def test_first_run_midday_base_ignores_earlier_transfers(tmp_path):
+    cl = FakeClient(legs={0: ["Buy", 0.0, 100.0]})
+    bot, store, clock = make_bot(cl, tmp_path)
+    cl.deposit(100.0, ts_ms=_ms(5))                          # утренний перевод — не прибыль
+    cl.add_realized(4.0, ts_ms=_ms(6))                       # +4 при базе 500 = 0.8%
+    bot.step()
+    row = store.get_day("2026-10-19")
+    assert abs(row["start_equity"] - 500.0) < 1e-9 and row["goal_reached"] == 0
+
+
+def test_first_run_midday_ignores_trades_from_yesterday(tmp_path):
+    cl = FakeClient(legs={0: ["Buy", 0.0, 100.0]})
+    bot, store, clock = make_bot(cl, tmp_path)
+    cl.add_realized(50.0, ts_ms=_ms(22, day=18))             # вчера
+    bot.step()
+    assert store.get_day("2026-10-19")["goal_reached"] == 0
+
+
+def test_first_run_midday_open_positions_closed_after_goal_found(tmp_path):
+    cl = FakeClient(legs={0: ["Buy", 2.0, 100.0]})
+    bot, store, clock = make_bot(cl, tmp_path)
+    cl.add_realized(15.0, ts_ms=_ms(3))
+    for _ in range(6):
+        bot.step()
+    assert store.get_day("2026-10-19")["goal_reached"] == 1
+    assert cl.orders and cl.legs[0][1] <= 1e-9
+
+
+def test_after_goal_no_transaction_log_or_equity_requests(tmp_path):
+    cl = FakeClient(legs={0: ["Buy", 0.0, 100.0]})
+    bot, store, clock = make_bot(cl, tmp_path)
+    cl.add_realized(15.0, ts_ms=_ms(3))
+    bot.step()                                               # цель найдена и записана
+    calls = cl.tx_calls
+    eq_calls = {"n": 0}
+    orig = cl.get_equity
+    cl.get_equity = lambda t: (eq_calls.__setitem__("n", eq_calls["n"] + 1), orig(t))[1]
+    for _ in range(5):
+        clock.advance(seconds=10)
+        bot.step()
+    assert cl.tx_calls == calls and eq_calls["n"] == 0
+
+
+def test_after_goal_restart_does_not_query_log_either(tmp_path):
+    cl = FakeClient(legs={0: ["Buy", 0.0, 100.0]})
+    bot, store, clock = make_bot(cl, tmp_path)
+    cl.add_realized(15.0, ts_ms=_ms(3))
+    bot.step()
+    store.close()
+    store2 = StateStore(str(tmp_path / "state.db"))
+    bot2, _, _ = make_bot(cl, tmp_path, clock=clock, store=store2)
+    calls = cl.tx_calls
+    bot2.step()
+    assert cl.tx_calls == calls
 
 
 def test_funding_and_fees_are_in_realized_and_foreign_types_excluded(tmp_path):

@@ -111,7 +111,7 @@ class BybitClient:
         acc = res["list"][0]
         return float(acc.get("totalEquity") or 0)
 
-    def get_transaction_log(self, account_type: str, category: str, currency: str,
+    def get_transaction_log(self, account_type: str, category: str | None, currency: str,
                             start_ms: int, end_ms: int) -> list[dict]:
         """Записи лога транзакций UTA за интервал (≤7 дней), все страницы."""
         out: list[dict] = []
