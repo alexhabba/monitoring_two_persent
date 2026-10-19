@@ -1,8 +1,11 @@
-"""Оценка баланса «как если бы всё закрыли сейчас».
+"""Оценка торгового результата дня «как если бы всё закрыли сейчас».
 
-Баланс счёта (totalEquity) уже включает: реализованный PnL, комиссии входа/выхода прошлых сделок,
-фандинг и нереализованный PnL по mark-цене. Чтобы получить честный результат закрытия, к нему
-добавляется поправка по каждой позиции:
+Результат дня = реализованный (лог транзакций: сделки, комиссии, фандинг)
+              + изменение нереализованного PnL с начала дня (unrealisedPnl сейчас − на начало дня)
+              + поправка на выход.
+
+Баланс счёта в расчёте не участвует (кроме знаменателя — базы дня), поэтому пополнения, выводы,
+переводы и изменение цены обеспечения не влияют. Поправка на выход по каждой позиции:
 
     поправка = (цена выхода − mark) × размер × знак  −  комиссия выхода (тейкер)
 
@@ -25,6 +28,7 @@ class PositionView:
     cum_realised: float
     position_idx: int
     position_im: float
+    unrealised_pnl: float = 0.0
 
     @property
     def key(self) -> Key:
@@ -45,6 +49,7 @@ def parse_position(raw: dict) -> PositionView:
         cum_realised=float(raw.get("cumRealisedPnl") or 0),
         position_idx=int(raw.get("positionIdx") or 0),
         position_im=float(raw.get("positionIM") or 0),
+        unrealised_pnl=float(raw.get("unrealisedPnl") or 0),
     )
 
 
@@ -66,22 +71,26 @@ def exit_adjustment(p: PositionView, bid: float, ask: float, taker_fee: float, s
 
 @dataclass
 class Evaluation:
-    equity: float = 0.0
+    equity: float = 0.0          # баланс счёта — только для справки в логе
+    start_equity: float = 0.0    # база дня (знаменатель процента)
+    realized: float = 0.0
+    unrealised: float = 0.0
+    unrealised_delta: float = 0.0
     adjustment: float = 0.0
-    projected: float = 0.0      # баланс с учётом выхода
-    start_equity: float = 0.0
-    gain: float = 0.0
+    gain: float = 0.0            # итоговый результат дня с учётом выхода
     pct: float = 0.0
     goal: bool = False
 
 
-def evaluate(equity: float, start_equity: float, positions: list[PositionView],
-             books: dict[str, dict], taker_fees: dict[str, float], slippage_bps: float) -> Evaluation:
+def evaluate(start_equity: float, start_unrealised: float, realized: float,
+             positions: list[PositionView], books: dict[str, dict],
+             taker_fees: dict[str, float], slippage_bps: float, equity: float = 0.0) -> Evaluation:
     adj = 0.0
     for p in positions:
         bid, ask = best_prices(books[p.symbol])
         adj += exit_adjustment(p, bid, ask, taker_fees[p.symbol], slippage_bps)
-    projected = equity + adj
-    gain = projected - start_equity
+    unreal = sum(p.unrealised_pnl for p in positions)
+    delta = unreal - start_unrealised
+    gain = realized + delta + adj
     pct = gain / start_equity * 100 if start_equity > 0 else 0.0
-    return Evaluation(equity, adj, projected, start_equity, gain, pct)
+    return Evaluation(equity, start_equity, realized, unreal, delta, adj, gain, pct)

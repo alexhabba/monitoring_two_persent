@@ -111,6 +111,21 @@ class BybitClient:
         acc = res["list"][0]
         return float(acc.get("totalEquity") or 0)
 
+    def get_transaction_log(self, account_type: str, category: str, currency: str,
+                            start_ms: int, end_ms: int) -> list[dict]:
+        """Записи лога транзакций UTA за интервал (≤7 дней), все страницы."""
+        out: list[dict] = []
+        cursor = None
+        while True:
+            res = self._request("GET", "/v5/account/transaction-log", {
+                "accountType": account_type, "category": category, "currency": currency,
+                "startTime": start_ms, "endTime": end_ms, "limit": 50, "cursor": cursor,
+            })
+            out.extend(res.get("list", []))
+            cursor = res.get("nextPageCursor")
+            if not cursor:
+                return out
+
     def get_fee_rates(self, category: str, symbol: str) -> tuple[float, float]:
         """(maker, taker) для символа с учётом VIP-уровня аккаунта."""
         res = self._request("GET", "/v5/account/fee-rate", {"category": category, "symbol": symbol})

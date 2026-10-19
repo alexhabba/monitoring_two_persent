@@ -13,10 +13,13 @@ CREATE TABLE IF NOT EXISTS days(
     target_pct     REAL NOT NULL,
     goal_reached   INTEGER NOT NULL DEFAULT 0,
     goal_ts        TEXT,
-    goal_equity    REAL,               -- прогнозный баланс с учётом выхода в момент достижения цели
-    goal_pct       REAL,
-    final_equity   REAL,               -- баланс после закрытия всех позиций
-    final_ts       TEXT
+    goal_equity    REAL,               -- баланс счёта в момент достижения цели (справочно)
+    goal_pct       REAL,               -- результат дня в % от базы в момент цели
+    final_equity   REAL,               -- баланс после закрытия всех позиций (справочно)
+    final_ts       TEXT,
+    start_unrealised REAL NOT NULL DEFAULT 0,  -- нереализованный PnL на начало дня
+    goal_gain      REAL,               -- результат дня в USDT в момент цели
+    final_gain     REAL                -- результат дня в USDT после закрытия всего
 );
 CREATE TABLE IF NOT EXISTS events(
     id   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,7 +40,14 @@ class StateStore:
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        have = {r[1] for r in self.conn.execute("PRAGMA table_info(days)")}
+        for col, ddl in (("start_unrealised", "REAL NOT NULL DEFAULT 0"), ("goal_gain", "REAL"), ("final_gain", "REAL")):
+            if col not in have:
+                self.conn.execute(f"ALTER TABLE days ADD COLUMN {col} {ddl}")
 
     def close(self) -> None:
         self.conn.close()
@@ -49,21 +59,22 @@ class StateStore:
         row = self.conn.execute("SELECT * FROM days WHERE day=?", (day,)).fetchone()
         return dict(row) if row else None
 
-    def create_day(self, day: str, equity: float, ts: str, kind: str, target_pct: float) -> None:
+    def create_day(self, day: str, equity: float, unrealised: float, ts: str, kind: str, target_pct: float) -> None:
         with self.conn:
             self.conn.execute(
-                "INSERT OR IGNORE INTO days(day,start_equity,start_ts,start_kind,target_pct) VALUES(?,?,?,?,?)",
-                (day, equity, ts, kind, target_pct))
+                "INSERT OR IGNORE INTO days(day,start_equity,start_unrealised,start_ts,start_kind,target_pct) "
+                "VALUES(?,?,?,?,?,?)", (day, equity, unrealised, ts, kind, target_pct))
 
-    def mark_goal(self, day: str, ts: str, equity: float, pct: float) -> None:
+    def mark_goal(self, day: str, ts: str, equity: float, gain: float, pct: float) -> None:
         with self.conn:
             self.conn.execute(
-                "UPDATE days SET goal_reached=1, goal_ts=?, goal_equity=?, goal_pct=? WHERE day=?",
-                (ts, equity, pct, day))
+                "UPDATE days SET goal_reached=1, goal_ts=?, goal_equity=?, goal_gain=?, goal_pct=? WHERE day=?",
+                (ts, equity, gain, pct, day))
 
-    def set_final(self, day: str, ts: str, equity: float) -> None:
+    def set_final(self, day: str, ts: str, equity: float, gain: float) -> None:
         with self.conn:
-            self.conn.execute("UPDATE days SET final_equity=?, final_ts=? WHERE day=?", (equity, ts, day))
+            self.conn.execute("UPDATE days SET final_equity=?, final_gain=?, final_ts=? WHERE day=?",
+                              (equity, gain, ts, day))
 
     def add_event(self, day: str, ts: str, kind: str, text: str) -> None:
         with self.conn:

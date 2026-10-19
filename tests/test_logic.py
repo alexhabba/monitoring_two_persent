@@ -6,6 +6,7 @@ from bot.closer import PositionCloser, book_depth, plan_chunk
 from bot.config import Config
 from bot.logsetup import DailyFileHandler
 from bot.monitor import Bot
+from bot.daypnl import DayPnlTracker
 from bot.pnl import PositionView, exit_adjustment, evaluate
 from bot.state import StateStore
 from bot.timeutil import get_tz
@@ -50,10 +51,19 @@ def test_slippage_reduces_projection():
     assert b < a
 
 
-def test_evaluate_pct_against_day_start():
-    ev = evaluate(510.0, 500.0, [pos()], {"BTCUSDT": BOOK}, {"BTCUSDT": 0.0}, 0)
-    assert abs(ev.projected - 510.0) < 1e-9
-    assert abs(ev.pct - 2.0) < 1e-9
+def test_evaluate_gain_is_realized_plus_unrealised_delta_plus_exit():
+    p = pos(size=2.0)
+    p.unrealised_pnl = 25.0
+    ev = evaluate(500.0, 10.0, 5.0, [p], {"BTCUSDT": BOOK}, {"BTCUSDT": 0.0}, 0, equity=999.0)
+    exit_adj = exit_adjustment(p, 100.0, 100.1, 0.0, 0)
+    assert abs(ev.gain - (5.0 + (25.0 - 10.0) + exit_adj)) < 1e-9
+    assert abs(ev.pct - ev.gain / 500.0 * 100) < 1e-9
+
+
+def test_balance_is_not_used_in_gain():
+    a = evaluate(500.0, 0.0, 0.0, [], {}, {}, 0, equity=500.0)
+    b = evaluate(500.0, 0.0, 0.0, [], {}, {}, 0, equity=99999.0)
+    assert a.gain == b.gain == 0.0
 
 
 def test_book_depth_only_within_bps():
@@ -81,24 +91,56 @@ def test_wide_spread_skips():
 
 # ---------- фейковая биржа ----------
 class FakeClient:
-    """legs: idx -> [side, size, avg]. Баланс = база + реализованное + нереализованное по mark."""
+    """legs: idx -> [side, size, avg]. Баланс = база + реализованное + нереализованное + переводы + обеспечение."""
 
     def __init__(self, legs=None, base=500.0, mark=100.0):
         self.legs = legs if legs is not None else {0: ["Buy", 3.0, 100.0]}
-        self.base, self.realized, self.mark = base, 0.0, mark
+        self.base, self.mark = base, mark
+        self.realized = 0.0
+        self.transfers = 0.0
+        self.collateral_pnl = 0.0
         self.orders = []
+        self.tx = []
+        self.clock = None
+        self.tx_calls = 0
+        self._id = 0
 
+    # --- журнал транзакций ---
+    def _log(self, typ, change, ts_ms=None):
+        self._id += 1
+        t = ts_ms if ts_ms is not None else int(self.clock().timestamp() * 1000)
+        self.tx.append({"id": f"t{self._id}", "type": typ, "change": str(change),
+                        "transactionTime": str(t), "currency": "USDT"})
+
+    def add_realized(self, amount, typ="TRADE", ts_ms=None):
+        self.realized += amount
+        self._log(typ, amount, ts_ms)
+
+    def deposit(self, amount):
+        self.transfers += amount
+        self._log("TRANSFER_IN" if amount > 0 else "TRANSFER_OUT", amount)
+
+    def get_transaction_log(self, account_type, category, currency, start_ms, end_ms):
+        self.tx_calls += 1
+        return [r for r in self.tx if start_ms <= int(r["transactionTime"]) <= end_ms]
+
+    # --- остальное API ---
     def unreal(self):
         return sum((self.mark - a) * z if s == "Buy" else (a - self.mark) * z
                    for s, z, a in self.legs.values() if z > 1e-9)
 
     def get_equity(self, t):
-        return self.base + self.realized + self.unreal()
+        return self.base + self.realized + self.unreal() + self.transfers + self.collateral_pnl
 
     def get_positions(self, category, settle):
-        return [{"symbol": "BTCUSDT", "side": s, "size": str(round(z, 8)), "avgPrice": str(a),
-                 "markPrice": str(self.mark), "cumRealisedPnl": "0", "positionIdx": i, "positionIM": "5"}
-                for i, (s, z, a) in self.legs.items() if z > 1e-9]
+        out = []
+        for i, (s, z, a) in self.legs.items():
+            if z > 1e-9:
+                u = (self.mark - a) * z if s == "Buy" else (a - self.mark) * z
+                out.append({"symbol": "BTCUSDT", "side": s, "size": str(round(z, 8)), "avgPrice": str(a),
+                            "markPrice": str(self.mark), "cumRealisedPnl": "0", "positionIdx": i,
+                            "positionIM": "5", "unrealisedPnl": str(u)})
+        return out
 
     def get_fee_rates(self, c, s): return 0.0002, 0.00055
     def get_orderbook(self, c, s, limit=50): return make_book(self.mark)
@@ -108,8 +150,9 @@ class FakeClient:
         leg = self.legs[idx]
         q = float(qty)
         self.orders.append((side, qty, price, idx))
-        self.realized += ((float(price) - leg[2]) if leg[0] == "Buy" else (leg[2] - float(price))) * q
+        pnl = ((float(price) - leg[2]) if leg[0] == "Buy" else (leg[2] - float(price))) * q
         leg[1] -= q
+        self.add_realized(pnl)       # реализованный PnL попадает в лог транзакций
         return f"oid{len(self.orders)}"
 
     def get_order(self, c, s, oid): return {"orderStatus": "Filled", "cumExecQty": self.orders[-1][1]}
@@ -126,6 +169,7 @@ def make_bot(client, tmp_path, clock=None, store=None, **kw):
     c = cfg(**kw)
     store = store or StateStore(str(tmp_path / "state.db"))
     clock = clock or Clock(datetime(2026, 10, 19, 14, 0, tzinfo=MSK))
+    client.clock = clock
     return Bot(client, c, store, PositionCloser(client, c, sleep=lambda s: None), clock=clock), store, clock
 
 
@@ -163,7 +207,8 @@ def test_goal_latched_then_everything_closed_and_final_recorded(tmp_path):
     assert all(float(o[1]) <= 1.0 + 1e-9 for o in cl.orders)   # не больше 10% глубины
     bot.step()
     row = store.get_day("2026-10-19")
-    assert row["final_equity"] is not None and row["final_equity"] > 500 * 1.02
+    assert row["final_gain"] is not None and row["final_gain"] >= 500 * 0.02 - 1.0
+    assert row["final_equity"] is not None
 
 
 def test_new_positions_after_goal_are_closed_even_at_a_loss(tmp_path):
@@ -184,7 +229,7 @@ def test_goal_already_earned_without_positions_blocks_new_ones(tmp_path):
     cl = FakeClient(legs={0: ["Buy", 0.0, 100.0]})
     bot, store, clock = make_bot(cl, tmp_path)
     bot.step()                       # база 500, позиций нет
-    cl.realized = 12.0               # прибыль уже зафиксирована
+    cl.add_realized(12.0)            # прибыль уже зафиксирована (запись в логе транзакций)
     bot.step()
     assert store.get_day("2026-10-19")["goal_reached"] == 1
     cl.legs[1] = ["Buy", 1.0, 100.0]
@@ -260,7 +305,7 @@ def test_hedge_legs_closed_proportionally_with_correct_idx_and_sides(tmp_path):
     bot, store, clock = make_bot(cl, tmp_path)
     cl.base = 500.0
     bot.step()                                      # база: 500
-    cl.realized = 12.0                              # прибыль зафиксирована -> цель достигнута
+    cl.add_realized(12.0)                           # прибыль зафиксирована -> цель достигнута
     bot.step()
     assert len(cl.orders) == 2
     by_idx = {o[3]: o for o in cl.orders}
@@ -272,12 +317,124 @@ def test_hedge_both_legs_end_flat(tmp_path):
     cl = FakeClient(legs={1: ["Buy", 3.0, 100.0], 2: ["Sell", 2.0, 100.0]})
     bot, store, clock = make_bot(cl, tmp_path)
     bot.step()
-    cl.realized = 12.0
+    cl.add_realized(12.0)
     for _ in range(40):
         bot.step()
         if not cl.get_positions("linear", "USDT"):
             break
     assert all(l[1] < 1e-9 for l in cl.legs.values())
+
+
+# ---------- вариант Б: переводы и обеспечение не влияют ----------
+def _base_bot(tmp_path, **kw):
+    cl = FakeClient(**kw)
+    bot, store, clock = make_bot(cl, tmp_path)
+    bot.step()                      # база дня 500
+    return cl, bot, store, clock
+
+
+def test_deposit_does_not_trigger_goal(tmp_path):
+    cl, bot, store, _ = _base_bot(tmp_path)
+    cl.deposit(100.0)               # баланс +20%, но это не торговля
+    ev = bot.step()
+    assert abs(ev.pct) < 0.5 and not cl.orders and not store.get_day("2026-10-19")["goal_reached"]
+
+
+def test_deposit_with_losing_positions_does_not_hide_loss(tmp_path):
+    cl, bot, store, _ = _base_bot(tmp_path)
+    cl.mark = 99.0                  # -9 на позициях
+    cl.deposit(100.0)
+    ev = bot.step()
+    assert ev.pct < 0 and not cl.orders
+
+
+def test_withdrawal_does_not_hide_real_profit(tmp_path):
+    cl, bot, store, _ = _base_bot(tmp_path)
+    cl.mark = 104.0                 # +12 по позициям
+    cl.deposit(-50.0)               # вывели 50: баланс ниже базы, но торговый результат +
+    ev = bot.step()
+    assert ev.pct >= 2.0 and store.get_day("2026-10-19")["goal_reached"] == 1 and cl.orders
+
+
+def test_collateral_price_move_does_not_trigger_goal(tmp_path):
+    cl, bot, store, _ = _base_bot(tmp_path)
+    cl.collateral_pnl = 60.0        # обеспечение в BTC выросло: баланс +12%
+    ev = bot.step()
+    assert abs(ev.pct) < 0.5 and not cl.orders
+
+
+def test_unrealised_at_day_start_is_not_counted_as_todays_profit(tmp_path):
+    cl = FakeClient(legs={0: ["Buy", 3.0, 96.0]})   # на старте уже +12 нереализованного
+    bot, store, clock = make_bot(cl, tmp_path)
+    bot.step()
+    row = store.get_day("2026-10-19")
+    assert abs(row["start_unrealised"] - 12.0) < 1e-9
+    ev = bot.step()
+    assert abs(ev.unrealised_delta) < 1e-9 and ev.pct < 0.1 and not cl.orders
+    cl.mark = 104.0                 # дальше +12 уже сегодняшние
+    ev = bot.step()
+    assert ev.pct >= 2.0
+
+
+def test_trades_before_day_start_are_ignored(tmp_path):
+    cl = FakeClient()
+    bot, store, clock = make_bot(cl, tmp_path)
+    cl.add_realized(50.0, ts_ms=int(datetime(2026, 10, 19, 3, 0, tzinfo=MSK).timestamp() * 1000))
+    bot.step()                      # первый запуск в 14:00: вчерашнее/утреннее не считается
+    assert bot.step().realized == 0.0
+
+
+def test_funding_and_fees_are_in_realized_and_foreign_types_excluded(tmp_path):
+    cl, bot, store, _ = _base_bot(tmp_path)
+    cl.add_realized(-0.3, "SETTLEMENT")     # фандинг
+    cl.add_realized(-0.2, "TRADE")          # комиссия
+    cl.add_realized(7.0, "BONUS")           # не торговля
+    cl.add_realized(9.0, "CURRENCY_SELL")   # конвертация
+    ev = bot.step()
+    assert abs(ev.realized - (-0.5)) < 1e-9
+
+
+def test_incremental_fetch_does_not_double_count(tmp_path):
+    cl, bot, store, clock = _base_bot(tmp_path)
+    cl.add_realized(2.0)
+    for _ in range(5):
+        clock.advance(seconds=10)
+        ev = bot.step()
+    assert abs(ev.realized - 2.0) < 1e-9
+
+
+def test_full_refresh_picks_up_late_entry(tmp_path):
+    cl, bot, store, clock = _base_bot(tmp_path)
+    clock.advance(minutes=30)
+    bot.step()
+    late = int((clock() - timedelta(minutes=20)).timestamp() * 1000)   # запись «задним числом»
+    cl.add_realized(3.0, ts_ms=late)
+    clock.advance(minutes=11)       # прошёл интервал полного пересчёта
+    assert abs(bot.step().realized - 3.0) < 1e-9
+
+
+def test_goal_closing_continues_if_transaction_log_fails(tmp_path):
+    cl, bot, store, clock = _base_bot(tmp_path)
+    cl.mark = 104.0
+    bot.step()                      # цель достигнута, пошло закрытие
+    n = len(cl.orders)
+    cl.get_transaction_log = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("api down"))
+    clock.advance(seconds=10)
+    bot.step()
+    assert len(cl.orders) > n       # закрытие не зависит от лога
+
+
+def test_no_decision_without_transaction_log_before_goal(tmp_path):
+    cl, bot, store, clock = _base_bot(tmp_path)
+    cl.mark = 104.0
+    cl.get_transaction_log = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("api down"))
+    clock.advance(seconds=10)
+    try:
+        bot.step()
+        assert False, "должно выбросить"
+    except RuntimeError:
+        pass
+    assert not cl.orders and not store.get_day("2026-10-19")["goal_reached"]
 
 
 # ---------- логи ----------
