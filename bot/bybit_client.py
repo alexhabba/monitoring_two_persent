@@ -1,0 +1,148 @@
+"""Тонкий клиент Bybit V5 (REST) на requests с HMAC-подписью."""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import time
+from typing import Any
+from urllib.parse import urlencode
+
+import requests
+
+MAINNET = "https://api.bybit.com"
+TESTNET = "https://api-testnet.bybit.com"
+
+# Ошибки, при которых отмену/повторную отмену можно спокойно игнорировать
+ORDER_GONE_CODES = {110001, 170213, 170142}
+
+
+class BybitError(Exception):
+    def __init__(self, code: int, msg: str, path: str = ""):
+        super().__init__(f"Bybit {path} retCode={code}: {msg}")
+        self.code = code
+        self.msg = msg
+
+
+class BybitClient:
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        testnet: bool = False,
+        base_url: str = "",
+        recv_window: int = 5000,
+        timeout: float = 10.0,
+        session: requests.Session | None = None,
+    ):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.base_url = (base_url or (TESTNET if testnet else MAINNET)).rstrip("/")
+        self.recv_window = str(recv_window)
+        self.timeout = timeout
+        self.session = session or requests.Session()
+
+    # ---------- низкий уровень ----------
+    def _sign(self, ts: str, payload: str) -> str:
+        msg = f"{ts}{self.api_key}{self.recv_window}{payload}"
+        return hmac.new(self.api_secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
+
+    def _request(self, method: str, path: str, params: dict | None = None,
+                 body: dict | None = None, auth: bool = True) -> dict[str, Any]:
+        headers = {"Content-Type": "application/json"}
+        url = self.base_url + path
+        data = None
+        payload = ""
+        if method == "GET":
+            qs = urlencode({k: v for k, v in (params or {}).items() if v is not None})
+            payload = qs
+            if qs:
+                url = f"{url}?{qs}"
+        else:
+            data = json.dumps(body or {}, separators=(",", ":"))
+            payload = data
+        if auth:
+            ts = str(int(time.time() * 1000))
+            headers.update({
+                "X-BAPI-API-KEY": self.api_key,
+                "X-BAPI-TIMESTAMP": ts,
+                "X-BAPI-RECV-WINDOW": self.recv_window,
+                "X-BAPI-SIGN": self._sign(ts, payload),
+            })
+        resp = self.session.request(method, url, headers=headers, data=data, timeout=self.timeout)
+        resp.raise_for_status()
+        js = resp.json()
+        if js.get("retCode") != 0:
+            raise BybitError(js.get("retCode", -1), js.get("retMsg", ""), path)
+        return js.get("result", {})
+
+    # ---------- аккаунт ----------
+    def get_positions(self, category: str, settle_coin: str) -> list[dict]:
+        out: list[dict] = []
+        cursor = None
+        while True:
+            res = self._request("GET", "/v5/position/list", {
+                "category": category, "settleCoin": settle_coin,
+                "limit": 200, "cursor": cursor,
+            })
+            out.extend(p for p in res.get("list", []) if float(p.get("size") or 0) > 0)
+            cursor = res.get("nextPageCursor")
+            if not cursor:
+                return out
+
+    def get_equity(self, account_type: str) -> float:
+        res = self._request("GET", "/v5/account/wallet-balance", {"accountType": account_type})
+        acc = res["list"][0]
+        return float(acc.get("totalEquity") or 0)
+
+    def get_fee_rates(self, category: str, symbol: str) -> tuple[float, float]:
+        """(maker, taker) для символа с учётом VIP-уровня аккаунта."""
+        res = self._request("GET", "/v5/account/fee-rate", {"category": category, "symbol": symbol})
+        row = res["list"][0]
+        return float(row["makerFeeRate"]), float(row["takerFeeRate"])
+
+    # ---------- рынок ----------
+    def get_orderbook(self, category: str, symbol: str, limit: int = 50) -> dict:
+        res = self._request("GET", "/v5/market/orderbook",
+                            {"category": category, "symbol": symbol, "limit": limit}, auth=False)
+        return {
+            "bids": [(float(p), float(q)) for p, q in res.get("b", [])],
+            "asks": [(float(p), float(q)) for p, q in res.get("a", [])],
+        }
+
+    def get_instrument(self, category: str, symbol: str) -> dict:
+        res = self._request("GET", "/v5/market/instruments-info",
+                            {"category": category, "symbol": symbol}, auth=False)
+        row = res["list"][0]
+        return {
+            "min_qty": float(row["lotSizeFilter"]["minOrderQty"]),
+            "qty_step": row["lotSizeFilter"]["qtyStep"],  # строкой — для Decimal
+            "tick_size": row["priceFilter"]["tickSize"],
+        }
+
+    # ---------- ордера ----------
+    def place_limit_close(self, category: str, symbol: str, side: str, qty: str,
+                          price: str, position_idx: int, link_id: str) -> str:
+        """Post-only reduce-only лимитка: гарантированно мейкер и не может открыть позицию."""
+        res = self._request("POST", "/v5/order/create", body={
+            "category": category, "symbol": symbol, "side": side,
+            "orderType": "Limit", "qty": qty, "price": price,
+            "timeInForce": "PostOnly", "reduceOnly": True,
+            "positionIdx": position_idx, "orderLinkId": link_id,
+        })
+        return res["orderId"]
+
+    def cancel_order(self, category: str, symbol: str, order_id: str) -> None:
+        try:
+            self._request("POST", "/v5/order/cancel",
+                          body={"category": category, "symbol": symbol, "orderId": order_id})
+        except BybitError as e:
+            if e.code not in ORDER_GONE_CODES:
+                raise
+
+    def get_order(self, category: str, symbol: str, order_id: str) -> dict | None:
+        res = self._request("GET", "/v5/order/realtime", {
+            "category": category, "symbol": symbol, "orderId": order_id, "openOnly": 0,
+        })
+        rows = res.get("list", [])
+        return rows[0] if rows else None
