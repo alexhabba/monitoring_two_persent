@@ -135,3 +135,46 @@ def test_closing_stops_when_pnl_drops_below_target():
     cl.avg = 100.0  # прибыль исчезла
     bot.step()
     assert not bot.closing
+
+
+# ---------- хедж: обе ноги по одному символу ----------
+class HedgeClient(FakeClient):
+    def __init__(self):
+        super().__init__()
+        self.legs = {1: ["Buy", 3.0, 90.0, -0.05], 2: ["Sell", 2.0, 110.0, -0.05]}
+
+    def get_positions(self, category, settle):
+        return [{"symbol": "BTCUSDT", "side": s, "size": str(round(z, 8)), "avgPrice": str(a),
+                 "markPrice": "100", "cumRealisedPnl": str(c), "positionIdx": i, "positionIM": "5"}
+                for i, (s, z, a, c) in self.legs.items() if z > 1e-9]
+
+    def place_limit_close(self, category, symbol, side, qty, price, idx, link):
+        self.orders.append((side, qty, price, idx))
+        leg = self.legs[idx]
+        leg[1] -= float(qty)
+        leg[3] += ((float(price) - leg[2]) if leg[0] == "Buy" else (leg[2] - float(price))) * float(qty)
+        return f"oid{len(self.orders)}"
+
+    def get_order(self, c, s, oid): return {"orderStatus": "Filled", "cumExecQty": self.orders[-1][1]}
+
+
+def test_hedge_legs_closed_proportionally_with_correct_idx_and_sides():
+    cl = HedgeClient()
+    bot = make_bot(cl, target_profit_pct=1.0)
+    bot.step()
+    assert len(cl.orders) == 2
+    by_idx = {o[3]: o for o in cl.orders}
+    assert by_idx[1][0] == "Sell" and by_idx[2][0] == "Buy"
+    long_frac = float(by_idx[1][1]) / 3.0
+    short_frac = float(by_idx[2][1]) / 2.0
+    assert abs(long_frac - short_frac) < 0.01  # хедж не перекошен
+
+
+def test_hedge_both_legs_end_flat():
+    cl = HedgeClient()
+    bot = make_bot(cl, target_profit_pct=1.0)
+    for _ in range(40):
+        bot.step()
+        if not cl.get_positions("linear", "USDT"):
+            break
+    assert all(leg[1] < 1e-9 for leg in cl.legs.values())

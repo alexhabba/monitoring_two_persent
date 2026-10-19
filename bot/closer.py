@@ -52,7 +52,8 @@ def _floor_to_step(value: Decimal, step: Decimal) -> Decimal:
     return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
 
 
-def plan_chunk(p: PositionView, book: dict, instrument: dict, cfg: Config) -> ChunkPlan | None:
+def plan_chunk(p: PositionView, book: dict, instrument: dict, cfg: Config,
+               fraction: float | None = None) -> ChunkPlan | None:
     if not book["bids"] or not book["asks"]:
         return None
     bid, ask = best_prices(book)
@@ -65,8 +66,13 @@ def plan_chunk(p: PositionView, book: dict, instrument: dict, cfg: Config) -> Ch
     min_qty = Decimal(str(instrument["min_qty"]))
     remaining = Decimal(str(p.size))
 
-    depth = book_depth(book, p.close_side, cfg.book_depth_bps)
-    qty = _floor_to_step(Decimal(str(depth * cfg.book_fraction)), step)
+    if fraction is not None:  # парная нога хеджа: та же доля позиции, что закрыта на первой ноге
+        qty = _floor_to_step(remaining * Decimal(str(fraction)), step)
+    else:
+        depth = book_depth(book, p.close_side, cfg.book_depth_bps)
+        qty = _floor_to_step(Decimal(str(depth * cfg.book_fraction)), step)
+    if fraction is not None and qty < min_qty:
+        return None  # слишком мало для биржи — догоним на следующем шаге
     qty = max(qty, min_qty)
     qty = min(qty, remaining)
     if remaining - qty < min_qty:  # не оставляем «пыль», которую нельзя закрыть
@@ -97,9 +103,9 @@ class PositionCloser:
             self._instruments[symbol] = self.client.get_instrument(self.cfg.category, symbol)
         return self._instruments[symbol]
 
-    def close_chunk(self, p: PositionView, book: dict) -> float:
+    def close_chunk(self, p: PositionView, book: dict, fraction: float | None = None) -> float:
         """Ставит один лимитный ордер на кусок позиции. Возвращает исполненный объём."""
-        plan = plan_chunk(p, book, self.instrument(p.symbol), self.cfg)
+        plan = plan_chunk(p, book, self.instrument(p.symbol), self.cfg, fraction)
         if plan is None:
             return 0.0
         price_str = repr(plan.price) if plan.price != int(plan.price) else str(int(plan.price))

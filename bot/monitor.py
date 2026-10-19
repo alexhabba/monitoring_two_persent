@@ -95,7 +95,12 @@ class Bot:
         p = ordered[self._rr % len(ordered)]
         self._rr += 1
         try:
-            self.closer.close_chunk(p, books[p.symbol])
+            filled = self.closer.close_chunk(p, books[p.symbol])
+            # Хедж: на том же инструменте открыта противоположная нога — закрываем ту же долю,
+            # чтобы не остаться с перекошенной (направленной) позицией.
+            opp = next((q for q in positions if q.symbol == p.symbol and q.key != p.key), None)
+            if opp is not None and filled > 0 and p.size > 0:
+                self.closer.close_chunk(opp, books[opp.symbol], fraction=min(filled / p.size, 1.0))
         except Exception:  # одна неудачная лимитка не должна ронять бота
             log.exception("Ошибка при закрытии %s", p.symbol)
 
