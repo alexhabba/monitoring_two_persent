@@ -6,3 +6,4 @@ __pycache__/
 venv/
 .pytest_cache/
 .venv_broken_linux/
+data/

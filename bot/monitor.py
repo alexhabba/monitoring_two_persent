@@ -1,28 +1,33 @@
-"""Основной цикл: оценка чистого PnL по всем позициям и постепенное закрытие."""
+"""Основной цикл: дневная цель от баланса на 00:00 (МСК) и закрытие позиций после её достижения."""
 from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime
 
 from .bybit_client import BybitClient
 from .closer import PositionCloser
 from .config import Config
-from .pnl import Evaluation, Key, PositionView, evaluate, parse_position, profit_base
+from .pnl import Evaluation, PositionView, evaluate, parse_position
+from .state import StateStore
+from .timeutil import get_tz
 
 log = logging.getLogger("monitor")
 
 
 class Bot:
-    def __init__(self, client: BybitClient, cfg: Config, closer: PositionCloser | None = None):
+    def __init__(self, client: BybitClient, cfg: Config, store: StateStore,
+                 closer: PositionCloser | None = None, clock=None):
         self.client = client
         self.cfg = cfg
+        self.store = store
         self.closer = closer or PositionCloser(client, cfg)
-        self.closing = False
-        self.frozen_base: float | None = None
-        self.locked: dict[Key, float] = {}   # PnL полностью закрытых за эту сессию позиций
-        self._last_net: dict[Key, float] = {}
+        self.tz = get_tz(cfg.timezone)
+        self.clock = clock or (lambda: datetime.now(self.tz))
         self._fee_cache: dict[str, tuple[float, float]] = {}
-        self._rr = 0  # round-robin по позициям
+        self._rr = 0
+        self._pending_final = False  # были позиции, закрываемые после цели — нужно записать итог дня
+        self.closing = False
 
     # ---------- вспомогательное ----------
     def _taker_fee(self, symbol: str) -> float:
@@ -32,62 +37,66 @@ class Bot:
             self._fee_cache[symbol] = (time.time(), fee)
         return fee
 
-    def _track_vanished(self, positions: list[PositionView]) -> None:
-        current = {p.key for p in positions}
-        for key in list(self._last_net):
-            if key not in current and self.closing:
-                self.locked[key] = self._last_net[key]
-                log.info("Позиция %s закрыта полностью, зафиксировано ≈ %.4f", key, self.locked[key])
-        for key in current:
-            self.locked.pop(key, None)
+    def _ensure_day(self, equity: float) -> dict:
+        now = self.clock()
+        day = now.date().isoformat()
+        row = self.store.get_day(day)
+        if row:
+            return row
+        if self.store.count_days() == 0:
+            kind = "first_run"
+        elif now.hour == 0 and now.minute < 5:
+            kind = "midnight"
+        else:
+            kind = "late_start"  # бот был выключен в полночь — база = баланс на момент старта
+        self.store.create_day(day, equity, now.isoformat(), kind, self.cfg.target_profit_pct)
+        self.store.add_event(day, now.isoformat(), "day_start", f"{kind}: база дня {equity:.4f}")
+        log.warning("Новый день %s: база (баланс) = %.4f USDT [%s]. Цель +%.2f%% = %.4f",
+                    day, equity, kind, self.cfg.target_profit_pct,
+                    equity * (1 + self.cfg.target_profit_pct / 100))
+        self._pending_final = False
+        return self.store.get_day(day)
 
     # ---------- один шаг ----------
-    def step(self) -> Evaluation | None:
-        positions = [parse_position(r) for r in
-                     self.client.get_positions(self.cfg.category, self.cfg.settle_coin)]
-        self._track_vanished(positions)
+    def step(self) -> Evaluation:
+        cfg = self.cfg
+        now = self.clock()
+        equity = self.client.get_equity(cfg.account_type)
+        day = self._ensure_day(equity)
+        positions = [parse_position(r) for r in self.client.get_positions(cfg.category, cfg.settle_coin)]
 
-        if not positions:
-            log.info("Открытых позиций нет (category=%s, settleCoin=%s)",
-                     self.cfg.category, self.cfg.settle_coin)
-            if self.locked:
-                log.info("Все позиции закрыты. Итог сессии ≈ %.4f USDT", sum(self.locked.values()))
-            self.locked.clear()
-            self._last_net.clear()
-            self.closing = False
-            self.frozen_base = None
-            return None
-
-        books = {s: self.client.get_orderbook(self.cfg.category, s, self.cfg.book_limit)
+        books = {s: self.client.get_orderbook(cfg.category, s, cfg.book_limit)
                  for s in {p.symbol for p in positions}}
         fees = {s: self._taker_fee(s) for s in books}
+        ev = evaluate(equity, day["start_equity"], positions, books, fees, cfg.slippage_buffer_bps)
 
-        if self.closing and self.frozen_base:
-            base = self.frozen_base
-        else:
-            equity = self.client.get_equity(self.cfg.account_type)
-            base = profit_base(self.cfg.profit_base, equity, positions)
+        goal = bool(day["goal_reached"])
+        if not goal and ev.pct >= cfg.target_profit_pct:
+            self.store.mark_goal(day["day"], now.isoformat(), ev.projected, ev.pct)
+            self.store.add_event(day["day"], now.isoformat(), "goal",
+                                 f"цель достигнута: {ev.pct:.3f}% (баланс с учётом выхода {ev.projected:.4f})")
+            goal = True
+            log.warning("ЦЕЛЬ ДНЯ ДОСТИГНУТА: %.3f%% >= %.2f%% (прогнозный баланс %.4f, база %.4f). "
+                        "Закрываем все позиции и все новые до конца дня.%s",
+                        ev.pct, cfg.target_profit_pct, ev.projected, ev.start_equity,
+                        " [DRY-RUN: ордера не отправляются]" if cfg.dry_run else "")
+        ev.goal = goal
+        self.closing = goal and bool(positions)
 
-        ev = evaluate(positions, books, fees, base, self.locked, self.cfg.slippage_buffer_bps)
-        self._last_net = dict(ev.per_position)
+        log.info("%s | баланс %.4f (база %.4f) | с учётом выхода %.4f | %+.3f%% / цель %.2f%% | позиций %d%s",
+                 day["day"], ev.equity, ev.start_equity, ev.projected, ev.pct, cfg.target_profit_pct,
+                 len(positions), " | ЦЕЛЬ ВЫПОЛНЕНА" if goal else "")
 
-        log.info("Позиций: %d | чистый PnL ≈ %.4f USDT | %.3f%% от %s=%.2f (цель %.2f%%)%s",
-                 len(positions), ev.total_net, ev.pct, self.cfg.profit_base, base,
-                 self.cfg.target_profit_pct, " | ЗАКРЫТИЕ" if self.closing else "")
-
-        if ev.pct >= self.cfg.target_profit_pct:
-            if not self.closing:
-                self.closing = True
-                self.frozen_base = base
-                log.warning("Цель достигнута (%.3f%% >= %.2f%%) — начинаем постепенное закрытие%s",
-                            ev.pct, self.cfg.target_profit_pct,
-                            " [DRY-RUN: ордера не отправляются]" if self.cfg.dry_run else "")
+        if goal and positions:
+            self._pending_final = True
             self._close_one_chunk(positions, books)
-        elif self.closing:
-            log.warning("PnL опустился ниже цели (%.3f%% < %.2f%%) — закрытие приостановлено",
-                        ev.pct, self.cfg.target_profit_pct)
-            self.closing = False
-            self.frozen_base = None
+        elif goal and not positions and self._pending_final:
+            self.store.set_final(day["day"], now.isoformat(), equity)
+            self.store.add_event(day["day"], now.isoformat(), "final",
+                                 f"все позиции закрыты, баланс {equity:.4f} ({ev.pct:+.3f}% от базы)")
+            log.warning("Все позиции закрыты. Итог: баланс %.4f, %+.3f%% от базы дня (%.4f).",
+                        equity, ev.pct, ev.start_equity)
+            self._pending_final = False
         return ev
 
     def _close_one_chunk(self, positions: list[PositionView], books: dict[str, dict]) -> None:
@@ -96,8 +105,7 @@ class Bot:
         self._rr += 1
         try:
             filled = self.closer.close_chunk(p, books[p.symbol])
-            # Хедж: на том же инструменте открыта противоположная нога — закрываем ту же долю,
-            # чтобы не остаться с перекошенной (направленной) позицией.
+            # Хедж: закрываем ту же долю противоположной ноги, чтобы не остаться с перекошенной позицией.
             opp = next((q for q in positions if q.symbol == p.symbol and q.key != p.key), None)
             if opp is not None and filled > 0 and p.size > 0:
                 self.closer.close_chunk(opp, books[opp.symbol], fraction=min(filled / p.size, 1.0))
@@ -107,8 +115,8 @@ class Bot:
     # ---------- цикл ----------
     def run(self) -> None:
         mode = "DRY-RUN (ордера не отправляются)" if self.cfg.dry_run else "БОЕВОЙ РЕЖИМ"
-        log.info("Старт. Режим: %s | testnet=%s | цель %.2f%% от %s",
-                 mode, self.cfg.testnet, self.cfg.target_profit_pct, self.cfg.profit_base)
+        log.info("Старт. Режим: %s | testnet=%s | цель +%.2f%% в день | пояс %s | состояние: %s",
+                 mode, self.cfg.testnet, self.cfg.target_profit_pct, self.cfg.timezone, self.cfg.state_path)
         while True:
             try:
                 self.step()

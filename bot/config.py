@@ -40,7 +40,10 @@ class Config:
     category: str = "linear"
     settle_coin: str = "USDT"
     target_profit_pct: float = 2.0
-    profit_base: str = "equity"  # equity | margin
+    timezone: str = "Europe/Moscow"
+    data_dir: str = "data"
+    log_dir: str = "logs"
+    log_retention_days: int = 7
     poll_interval_sec: float = 10.0
     close_loop_sleep_sec: float = 1.0
     slippage_buffer_bps: float = 2.0
@@ -49,6 +52,13 @@ class Config:
     max_spread_bps: float = 20.0
     order_timeout_sec: float = 15.0
     book_limit: int = 50
+
+    @property
+    def state_path(self) -> str:
+        net = "testnet" if self.testnet else "mainnet"
+        mode = "dry" if self.dry_run else "live"
+        # у DRY-RUN и боевого режима разные файлы: «цель выполнена» из теста не должна влиять на боевой режим
+        return f"{self.data_dir}/state_{net}_{mode}.db"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -64,7 +74,10 @@ class Config:
             category=_str("CATEGORY", "linear"),
             settle_coin=_str("SETTLE_COIN", "USDT"),
             target_profit_pct=_float("TARGET_PROFIT_PCT", 2.0),
-            profit_base=_str("PROFIT_BASE", "equity").lower(),
+            timezone=_str("TIMEZONE", "Europe/Moscow"),
+            data_dir=_str("DATA_DIR", "data"),
+            log_dir=_str("LOG_DIR", "logs"),
+            log_retention_days=int(_float("LOG_RETENTION_DAYS", 7)),
             poll_interval_sec=_float("POLL_INTERVAL_SEC", 10.0),
             close_loop_sleep_sec=_float("CLOSE_LOOP_SLEEP_SEC", 1.0),
             slippage_buffer_bps=_float("SLIPPAGE_BUFFER_BPS", 2.0),
@@ -77,8 +90,6 @@ class Config:
         return cfg
 
     def validate(self) -> None:
-        if self.profit_base not in ("equity", "margin"):
-            raise ValueError("PROFIT_BASE должен быть 'equity' или 'margin'")
         if not 0 < self.book_fraction <= 1:
             raise ValueError("BOOK_FRACTION должен быть в (0, 1]")
         if self.target_profit_pct <= 0:

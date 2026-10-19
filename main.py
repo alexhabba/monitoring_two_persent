@@ -2,45 +2,43 @@
 import argparse
 import dataclasses
 import logging
-import os
+import signal
 import sys
-from logging.handlers import RotatingFileHandler
 
 from bot.bybit_client import BybitClient
 from bot.config import Config
+from bot.logsetup import setup_logging
 from bot.monitor import Bot
-
-
-def setup_logging() -> None:
-    os.makedirs("logs", exist_ok=True)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    for h in (logging.StreamHandler(sys.stdout),
-              RotatingFileHandler("logs/bot.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")):
-        h.setFormatter(fmt)
-        root.addHandler(h)
+from bot.state import StateStore
+from bot.timeutil import get_tz
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Bybit: закрытие позиций при чистой прибыли >= цели")
+    ap = argparse.ArgumentParser(description="Bybit: дневная цель прибыли и закрытие позиций")
     ap.add_argument("--once", action="store_true", help="один проход оценки и выход")
-    ap.add_argument("--live", action="store_true", help="боевой режим (иначе используется DRY_RUN из .env)")
+    ap.add_argument("--live", action="store_true", help="боевой режим (иначе DRY_RUN из .env)")
     args = ap.parse_args()
 
-    setup_logging()
     cfg = Config.from_env()
     if args.live:
         cfg = dataclasses.replace(cfg, dry_run=False)
+    setup_logging(cfg.log_dir, get_tz(cfg.timezone), cfg.log_retention_days)
     if not cfg.api_key or not cfg.api_secret:
         sys.exit("Заполните BYBIT_API_KEY и BYBIT_API_SECRET в .env")
 
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))  # чистая остановка на сервере
+    store = StateStore(cfg.state_path)
     client = BybitClient(cfg.api_key, cfg.api_secret, cfg.testnet, cfg.base_url)
-    bot = Bot(client, cfg)
-    if args.once:
-        bot.step()
-    else:
-        bot.run()
+    bot = Bot(client, cfg, store)
+    try:
+        if args.once:
+            bot.step()
+        else:
+            bot.run()
+    except KeyboardInterrupt:
+        logging.getLogger("main").info("Остановлено.")
+    finally:
+        store.close()
 
 
 if __name__ == "__main__":

@@ -1,20 +1,18 @@
-"""Расчёт чистого PnL по позициям: с комиссией на выход и учётом фандинга.
+"""Оценка баланса «как если бы всё закрыли сейчас».
 
-Чистый PnL позиции = (цена выхода - цена входа) * размер   [для шорта наоборот]
-                   + cumRealisedPnl                          [уже содержит комиссию за вход и фандинг]
-                   - комиссия за выход
+Баланс счёта (totalEquity) уже включает: реализованный PnL, комиссии входа/выхода прошлых сделок,
+фандинг и нереализованный PnL по mark-цене. Чтобы получить честный результат закрытия, к нему
+добавляется поправка по каждой позиции:
 
-cumRealisedPnl в Bybit V5 — накопленный реализованный PnL текущей позиции,
-включая комиссию открытия, фандинг и уже закрытые части.
-Цена выхода считается консервативно: по противоположной стороне стакана
-(для лонга — best bid, для шорта — best ask) со штрафом на проскальзывание,
-комиссия — по тейкер-ставке, даже если реально закрываем мейкером.
+    поправка = (цена выхода − mark) × размер × знак  −  комиссия выхода (тейкер)
+
+Цена выхода консервативна: лонг по best bid, шорт по best ask, со штрафом на проскальзывание.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-Key = tuple[str, int]  # (symbol, positionIdx)
+Key = tuple[str, int]  # (symbol, positionIdx) — в хедж-режиме лонг и шорт это разные позиции
 
 
 @dataclass
@@ -26,7 +24,7 @@ class PositionView:
     mark_price: float
     cum_realised: float
     position_idx: int
-    position_im: float  # начальная маржа
+    position_im: float
 
     @property
     def key(self) -> Key:
@@ -59,36 +57,31 @@ def exit_price(side: str, bid: float, ask: float, slippage_bps: float) -> float:
     return bid * (1 - k) if side == "Buy" else ask * (1 + k)
 
 
-def position_net_pnl(p: PositionView, bid: float, ask: float,
-                     taker_fee: float, slippage_bps: float) -> float:
+def exit_adjustment(p: PositionView, bid: float, ask: float, taker_fee: float, slippage_bps: float) -> float:
     px = exit_price(p.side, bid, ask, slippage_bps)
-    gross = (px - p.avg_price) * p.size if p.side == "Buy" else (p.avg_price - px) * p.size
-    exit_fee = px * p.size * taker_fee
-    return gross + p.cum_realised - exit_fee
+    mark = p.mark_price if p.mark_price > 0 else (bid + ask) / 2
+    delta = (px - mark) * p.size if p.side == "Buy" else (mark - px) * p.size
+    return delta - px * p.size * taker_fee
 
 
 @dataclass
 class Evaluation:
-    per_position: dict[Key, float] = field(default_factory=dict)
-    locked: float = 0.0  # уже зафиксировано полностью закрытыми позициями
-    total_net: float = 0.0
-    base: float = 0.0
+    equity: float = 0.0
+    adjustment: float = 0.0
+    projected: float = 0.0      # баланс с учётом выхода
+    start_equity: float = 0.0
+    gain: float = 0.0
     pct: float = 0.0
+    goal: bool = False
 
 
-def profit_base(mode: str, equity: float, positions: list[PositionView]) -> float:
-    if mode == "margin":
-        return sum(p.position_im for p in positions)
-    return equity
-
-
-def evaluate(positions: list[PositionView], books: dict[str, dict],
-             taker_fees: dict[str, float], base: float,
-             locked: dict[Key, float], slippage_bps: float) -> Evaluation:
-    ev = Evaluation(locked=sum(locked.values()), base=base)
+def evaluate(equity: float, start_equity: float, positions: list[PositionView],
+             books: dict[str, dict], taker_fees: dict[str, float], slippage_bps: float) -> Evaluation:
+    adj = 0.0
     for p in positions:
         bid, ask = best_prices(books[p.symbol])
-        ev.per_position[p.key] = position_net_pnl(p, bid, ask, taker_fees[p.symbol], slippage_bps)
-    ev.total_net = sum(ev.per_position.values()) + ev.locked
-    ev.pct = ev.total_net / base * 100 if base > 0 else 0.0
-    return ev
+        adj += exit_adjustment(p, bid, ask, taker_fees[p.symbol], slippage_bps)
+    projected = equity + adj
+    gain = projected - start_equity
+    pct = gain / start_equity * 100 if start_equity > 0 else 0.0
+    return Evaluation(equity, adj, projected, start_equity, gain, pct)
