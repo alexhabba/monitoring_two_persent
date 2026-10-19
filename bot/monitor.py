@@ -48,6 +48,8 @@ class Bot:
         self._track_vanished(positions)
 
         if not positions:
+            log.info("Открытых позиций нет (category=%s, settleCoin=%s)",
+                     self.cfg.category, self.cfg.settle_coin)
             if self.locked:
                 log.info("Все позиции закрыты. Итог сессии ≈ %.4f USDT", sum(self.locked.values()))
             self.locked.clear()
