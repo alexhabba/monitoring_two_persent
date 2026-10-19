@@ -41,11 +41,18 @@ def run_diag(client: BybitClient, cfg: Config, tz, out=print) -> None:
         mark = "← считается" if typ in INCLUDED_TYPES and cat == cfg.category else ""
         out(f"  {typ:<22} {cat:<8} записей {n:>4}  сумма change {ch:+12.4f} {mark}")
     out(f"  ИТОГО все типы: {total_all:+.4f} | из них торговый результат (категория {cfg.category}): {total_trade:+.4f}")
-    est = equity - total_all
-    out(f"  База на 00:00 (баланс − все изменения): {est:.4f}"
-        + ("   <-- НЕ ПОДХОДИТ (≤ 0), поэтому бот взял текущий баланс" if est <= 0 else ""))
-    if est > 0:
-        out(f"  Результат дня по логу: {total_trade:+.4f} = {total_trade / est * 100:+.3f}% от базы (цель {cfg.target_profit_pct}%)")
+    est_mid = equity - total_all
+    est_cap = equity - total_trade
+    base = max(est_mid, est_cap)
+    out(f"  Баланс на 00:00 (баланс − все изменения): {est_mid:.4f}"
+        + ("   <-- на 00:00 счёт был пуст / пополнен днём" if est_mid <= 0 else ""))
+    out(f"  Капитал без результата дня (баланс − торговый результат): {est_cap:.4f}")
+    if base > 0:
+        out(f"  База для процента = {base:.4f}. Результат дня по логу: {total_trade:+.4f} = "
+            f"{total_trade / base * 100:+.3f}% (цель {cfg.target_profit_pct}%) -> "
+            + ("ЦЕЛЬ ВЫПОЛНЕНА" if total_trade / base * 100 >= cfg.target_profit_pct else "цель не выполнена"))
+    else:
+        out("  База не определена (≤ 0).")
 
     out("\nПоследние записи лога:")
     for r in sorted(rows, key=lambda r: int(r.get("transactionTime") or 0))[-15:]:

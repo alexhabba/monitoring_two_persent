@@ -8,7 +8,7 @@ from datetime import datetime
 from .bybit_client import BybitClient
 from .closer import PositionCloser
 from .config import Config
-from .daypnl import DayPnlTracker
+from .daypnl import INCLUDED_TYPES, DayPnlTracker
 from .pnl import Evaluation, PositionView, evaluate, parse_position
 from .state import StateStore
 from .timeutil import get_tz
@@ -65,15 +65,22 @@ class Bot:
                 total = sum(float(r.get("change") or 0) for r in rows
                             if r.get("currency", self.cfg.settle_coin) == self.cfg.settle_coin
                             and int(r.get("transactionTime") or 0) >= int(midnight.timestamp() * 1000))
-                est = equity - total
-                if est <= 0:
-                    log.warning("Восстановить базу на 00:00 не удалось: баланс %.4f − изменения счёта за день %+.4f = %.4f "
-                                "(записей в логе: %d). Берём текущий баланс. Запустите ./run.sh diag",
-                                equity, total, est, len(rows))
+                trade = sum(float(r.get("change") or 0) for r in rows
+                            if r.get("type") in INCLUDED_TYPES and r.get("category") == self.cfg.category
+                            and r.get("currency", self.cfg.settle_coin) == self.cfg.settle_coin
+                            and int(r.get("transactionTime") or 0) >= int(midnight.timestamp() * 1000))
+                est_midnight = equity - total      # баланс на 00:00 (баланс сейчас − все изменения счёта за день)
+                est_capital = equity - trade       # капитал без торгового результата дня (переводы за день учтены)
+                base = max(est_midnight, est_capital)   # берём большую — процент получается осторожнее
+                if base <= 0:
+                    log.warning("Восстановить базу на 00:00 не удалось: баланс %.4f, изменения счёта %+.4f, торговый "
+                                "результат %+.4f. Берём текущий баланс. Запустите ./run.sh diag",
+                                equity, total, trade)
                 else:
-                    start_equity, start_ts = est, midnight.isoformat()
-                    note = (f"; база восстановлена на 00:00 (баланс {equity:.4f} − изменения счёта за день {total:+.4f}); "
-                            f"нереализованный PnL открытых позиций на 00:00 неизвестен — считаем только его дальнейшее изменение")
+                    start_equity, start_ts = base, midnight.isoformat()
+                    note = (f"; база восстановлена: баланс на 00:00 ≈ {est_midnight:.4f}, капитал без результата дня ≈ "
+                            f"{est_capital:.4f} (переводы за день {total - trade:+.4f}) — взято {base:.4f}; "
+                            f"нереализованный PnL позиций на 00:00 неизвестен — считаем только его дальнейшее изменение")
             except Exception:
                 log.exception("Не удалось восстановить базу на 00:00 — берём текущий баланс")
 

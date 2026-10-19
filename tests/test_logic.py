@@ -109,7 +109,8 @@ class FakeClient:
     def _log(self, typ, change, ts_ms=None):
         self._id += 1
         t = ts_ms if ts_ms is not None else int(self.clock().timestamp() * 1000)
-        self.tx.append({"id": f"t{self._id}", "type": typ, "change": str(change),
+        cat = "linear" if typ in ("TRADE", "SETTLEMENT", "DELIVERY", "LIQUIDATION", "ADL") else ""
+        self.tx.append({"id": f"t{self._id}", "type": typ, "change": str(change), "category": cat,
                         "transactionTime": str(t), "currency": "USDT"})
 
     def add_realized(self, amount, typ="TRADE", ts_ms=None):
@@ -398,7 +399,19 @@ def test_first_run_midday_base_ignores_earlier_transfers(tmp_path):
     cl.add_realized(4.0, ts_ms=_ms(6))                       # +4 при базе 500 = 0.8%
     bot.step()
     row = store.get_day("2026-10-19")
-    assert abs(row["start_equity"] - 500.0) < 1e-9 and row["goal_reached"] == 0
+    # капитал без результата дня = 604 − 4 = 600 (перевод в капитале, а не в прибыли) > баланса на 00:00 (500)
+    assert abs(row["start_equity"] - 600.0) < 1e-9 and row["goal_reached"] == 0
+
+
+def test_account_funded_during_the_day_goal_found_from_todays_trades(tmp_path):
+    cl = FakeClient(legs={0: ["Buy", 0.0, 100.0]}, base=0.0)    # в 00:00 счёт был пуст
+    bot, store, clock = make_bot(cl, tmp_path)
+    cl.deposit(111.79, ts_ms=_ms(10))
+    cl.add_realized(4.2855, ts_ms=_ms(11))
+    bot.step()
+    row = store.get_day("2026-10-19")
+    assert abs(row["start_equity"] - 111.79) < 1e-9
+    assert row["goal_reached"] == 1 and abs(row["goal_gain"] - 4.2855) < 1e-9
 
 
 def test_first_run_midday_ignores_trades_from_yesterday(tmp_path):
@@ -537,4 +550,4 @@ def test_diag_runs_and_reports_unusable_base(tmp_path):
     lines = []
     run_diag(cl, cfg(), MSK, out=lines.append)
     text = "\n".join(lines)
-    assert "TRANSFER_IN" in text and "НЕ ПОДХОДИТ" in text
+    assert "TRANSFER_IN" in text and "на 00:00 счёт был пуст" in text
