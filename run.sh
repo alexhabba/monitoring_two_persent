@@ -2,6 +2,7 @@
 # Использование: ./run.sh          — один проход (без ордеров)
 #                ./run.sh loop     — постоянный мониторинг (DRY_RUN из .env)
 #                ./run.sh live     — боевой режим (отправляет ордера!)
+#                ./run.sh diag     — показать, что Bybit отдаёт за сегодня (ничего не меняет)
 #                ./run.sh reset    — сбросить сегодняшний день в БД (dry и live) и выйти
 cd "$(dirname "$0")"
 if [ ! -f .venv/bin/activate ]; then
@@ -12,6 +13,7 @@ python3 -m pip install -q -r requirements.txt
 case "$1" in
   loop) python3 main.py ;;
   live) python3 main.py --live ;;
+  diag) python3 main.py --diag ;;
   reset) python3 main.py --reset-day; python3 main.py --reset-day --live ;;
   *)    python3 main.py --once ;;
 esac

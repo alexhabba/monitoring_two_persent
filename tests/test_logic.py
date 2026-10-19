@@ -523,3 +523,18 @@ def test_log_file_per_day_in_moscow_time(tmp_path):
     h.handle(rec)
     h.close()
     assert os.path.exists(tmp_path / "logs" / "bot-2026-10-20.log")
+
+
+def test_diag_runs_and_reports_unusable_base(tmp_path):
+    from bot.diag import run_diag
+    cl = FakeClient(legs={0: ["Buy", 0.0, 100.0]}, base=0.0)
+    cl.clock = Clock(datetime(2026, 10, 19, 14, 0, tzinfo=MSK))
+    cl._synced = True
+    cl.time_offset_ms = 0
+    cl.sync_time = lambda: None
+    cl.get_closed_pnl = lambda c, a, b: []
+    cl.deposit(112.0, ts_ms=_ms(10))          # счёт пополнен сегодня: на 00:00 баланс был 0
+    lines = []
+    run_diag(cl, cfg(), MSK, out=lines.append)
+    text = "\n".join(lines)
+    assert "TRANSFER_IN" in text and "НЕ ПОДХОДИТ" in text

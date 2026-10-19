@@ -66,7 +66,11 @@ class Bot:
                             if r.get("currency", self.cfg.settle_coin) == self.cfg.settle_coin
                             and int(r.get("transactionTime") or 0) >= int(midnight.timestamp() * 1000))
                 est = equity - total
-                if est > 0:
+                if est <= 0:
+                    log.warning("Восстановить базу на 00:00 не удалось: баланс %.4f − изменения счёта за день %+.4f = %.4f "
+                                "(записей в логе: %d). Берём текущий баланс. Запустите ./run.sh diag",
+                                equity, total, est, len(rows))
+                else:
                     start_equity, start_ts = est, midnight.isoformat()
                     note = (f"; база восстановлена на 00:00 (баланс {equity:.4f} − изменения счёта за день {total:+.4f}); "
                             f"нереализованный PnL открытых позиций на 00:00 неизвестен — считаем только его дальнейшее изменение")

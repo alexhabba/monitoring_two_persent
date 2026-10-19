@@ -126,6 +126,18 @@ class BybitClient:
             if not cursor:
                 return out
 
+    def get_closed_pnl(self, category: str, start_ms: int, end_ms: int) -> list[dict]:
+        """Закрытые позиции (closed PnL) за интервал — для диагностики."""
+        out: list[dict] = []
+        cursor = None
+        while True:
+            res = self._request("GET", "/v5/position/closed-pnl", {
+                "category": category, "startTime": start_ms, "endTime": end_ms, "limit": 100, "cursor": cursor})
+            out.extend(res.get("list", []))
+            cursor = res.get("nextPageCursor")
+            if not cursor:
+                return out
+
     def get_fee_rates(self, category: str, symbol: str) -> tuple[float, float]:
         """(maker, taker) для символа с учётом VIP-уровня аккаунта."""
         res = self._request("GET", "/v5/account/fee-rate", {"category": category, "symbol": symbol})
