@@ -31,7 +31,7 @@ class BybitClient:
         api_secret: str,
         testnet: bool = False,
         base_url: str = "",
-        recv_window: int = 5000,
+        recv_window: int = 20000,
         timeout: float = 10.0,
         session: requests.Session | None = None,
     ):
@@ -41,6 +41,17 @@ class BybitClient:
         self.recv_window = str(recv_window)
         self.timeout = timeout
         self.session = session or requests.Session()
+        self.time_offset_ms = 0  # серверное время минус локальное
+        self._synced = False
+
+    def sync_time(self) -> None:
+        """Поправка на расхождение часов с сервером Bybit."""
+        t0 = int(time.time() * 1000)
+        res = self._request("GET", "/v5/market/time", auth=False)
+        t1 = int(time.time() * 1000)
+        server_ms = int(res["timeNano"]) // 1_000_000 if res.get("timeNano") else int(res["timeSecond"]) * 1000
+        self.time_offset_ms = server_ms - (t0 + t1) // 2
+        self._synced = True
 
     # ---------- низкий уровень ----------
     def _sign(self, ts: str, payload: str) -> str:
@@ -48,7 +59,9 @@ class BybitClient:
         return hmac.new(self.api_secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
     def _request(self, method: str, path: str, params: dict | None = None,
-                 body: dict | None = None, auth: bool = True) -> dict[str, Any]:
+                 body: dict | None = None, auth: bool = True, _retry: bool = True) -> dict[str, Any]:
+        if auth and not self._synced:
+            self.sync_time()
         headers = {"Content-Type": "application/json"}
         url = self.base_url + path
         data = None
@@ -62,7 +75,7 @@ class BybitClient:
             data = json.dumps(body or {}, separators=(",", ":"))
             payload = data
         if auth:
-            ts = str(int(time.time() * 1000))
+            ts = str(int(time.time() * 1000) + self.time_offset_ms)
             headers.update({
                 "X-BAPI-API-KEY": self.api_key,
                 "X-BAPI-TIMESTAMP": ts,
@@ -72,6 +85,9 @@ class BybitClient:
         resp = self.session.request(method, url, headers=headers, data=data, timeout=self.timeout)
         resp.raise_for_status()
         js = resp.json()
+        if js.get("retCode") == 10002 and auth and _retry:  # часы разошлись — пересинхронизируем
+            self.sync_time()
+            return self._request(method, path, params, body, auth, _retry=False)
         if js.get("retCode") != 0:
             raise BybitError(js.get("retCode", -1), js.get("retMsg", ""), path)
         return js.get("result", {})
