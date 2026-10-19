@@ -3,11 +3,13 @@
 #                ./run.sh loop     — постоянный мониторинг (DRY_RUN из .env)
 #                ./run.sh live     — боевой режим (отправляет ордера!)
 cd "$(dirname "$0")"
-[ -d .venv ] || python3 -m venv .venv
+if [ ! -f .venv/bin/activate ]; then
+  python3 -m venv .venv || { echo "Не удалось создать окружение: установите Python 3 (python.org или 'xcode-select --install')"; exit 1; }
+fi
 source .venv/bin/activate
-pip install -q -r requirements.txt
+python3 -m pip install -q -r requirements.txt
 case "$1" in
-  loop) python main.py ;;
-  live) python main.py --live ;;
-  *)    python main.py --once ;;
+  loop) python3 main.py ;;
+  live) python3 main.py --live ;;
+  *)    python3 main.py --once ;;
 esac
