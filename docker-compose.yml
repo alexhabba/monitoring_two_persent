@@ -3,7 +3,11 @@ services:
     build: .
     container_name: monitoring_two_persent
     restart: unless-stopped
+    init: true
     env_file: .env          # ключи и настройки; DRY_RUN=false включает боевой режим
+    environment:            # приоритетнее env_file: состояние и логи всегда в смонтированном томе
+      DATA_DIR: /data
+      LOG_DIR: /data/logs
     volumes:
       - ./data:/data        # SQLite-состояние и логи (переживают пересоздание контейнера)
     stop_grace_period: 20s

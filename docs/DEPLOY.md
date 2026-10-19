@@ -35,7 +35,7 @@ docker compose run --rm bot python main.py --diag
 docker compose up -d --build
 docker compose logs -f
 ```
-Состояние и логи — в `./data` (том `/data`). Боевой режим: `DRY_RUN=false` в `.env`, затем `docker compose up -d`.
+Состояние и логи — в `./data` (том `/data`); пути `DATA_DIR`/`LOG_DIR` из `.env` внутри контейнера принудительно заменяются на `/data`. Боевой режим: `DRY_RUN=false` в `.env`, затем `docker compose up -d`.
 
 ## 3. Обслуживание
 * **Обновление:** `git pull`, затем `sudo systemctl restart monitoring_two_persent` (или `docker compose up -d --build`).
