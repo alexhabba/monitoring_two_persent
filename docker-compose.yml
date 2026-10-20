@@ -11,3 +11,8 @@ services:
     volumes:
       - ./data:/data        # SQLite-состояние и логи (переживают пересоздание контейнера)
     stop_grace_period: 20s
+    logging:                # ротация stdout-лога Docker: максимум 3 x 10 МБ
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
