@@ -39,7 +39,7 @@ class Config:
     account_type: str = "UNIFIED"
     category: str = "linear"
     settle_coin: str = "USDT"
-    target_profit_pct: float = 2.0
+    target_profit_pct: float = 4.0
     timezone: str = "Europe/Moscow"
     data_dir: str = "data"
     log_dir: str = "logs"
@@ -85,7 +85,7 @@ class Config:
             account_type=_str("ACCOUNT_TYPE", "UNIFIED"),
             category=_str("CATEGORY", "linear"),
             settle_coin=_str("SETTLE_COIN", "USDT"),
-            target_profit_pct=_float("TARGET_PROFIT_PCT", 2.0),
+            target_profit_pct=_float("TARGET_PROFIT_PCT", 4.0),
             timezone=_str("TIMEZONE", "Europe/Moscow"),
             data_dir=_str("DATA_DIR", "data"),
             log_dir=_str("LOG_DIR", "logs"),
