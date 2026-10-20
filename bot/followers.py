@@ -63,6 +63,30 @@ class FollowerSpec:
     enabled: bool = True
 
 
+def parse_specs(rows: list[dict], where: str = "followers") -> list[FollowerSpec]:
+    """Проверяет записи и возвращает включённые копии. Отключённые тоже проходят проверку имени."""
+    specs, seen = [], set()
+    for r in rows:
+        spec = FollowerSpec(
+            name=str(r["name"]).strip(), api_key=str(r.get("api_key", "")).strip(),
+            api_secret=str(r.get("api_secret", "")).strip(),
+            testnet=bool(r.get("testnet", False)), base_url=str(r.get("base_url", "")),
+            multiplier=float(r.get("multiplier", 1.0)), dry_run=bool(r.get("dry_run", False)),
+            enabled=bool(r.get("enabled", True)))
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,24}", spec.name):
+            raise ValueError(f"{where}: имя '{spec.name}' — только латиница, цифры, _ и -, до 24 символов")
+        if spec.name in seen:
+            raise ValueError(f"{where}: имя '{spec.name}' повторяется")
+        if spec.multiplier <= 0:
+            raise ValueError(f"{where}: multiplier у '{spec.name}' должен быть > 0")
+        if spec.enabled and not (spec.api_key and spec.api_secret):
+            raise ValueError(f"{where}: у '{spec.name}' пустые api_key/api_secret")
+        seen.add(spec.name)
+        if spec.enabled:
+            specs.append(spec)
+    return specs
+
+
 def load_specs(path: str) -> list[FollowerSpec]:
     try:
         with open(path, encoding="utf-8") as f:
@@ -70,25 +94,7 @@ def load_specs(path: str) -> list[FollowerSpec]:
     except FileNotFoundError:
         return []
     rows = raw.get("followers", []) if isinstance(raw, dict) else raw
-    specs, seen = [], set()
-    for r in rows:
-        spec = FollowerSpec(
-            name=str(r["name"]), api_key=str(r["api_key"]).strip(), api_secret=str(r["api_secret"]).strip(),
-            testnet=bool(r.get("testnet", False)), base_url=str(r.get("base_url", "")),
-            multiplier=float(r.get("multiplier", 1.0)), dry_run=bool(r.get("dry_run", False)),
-            enabled=bool(r.get("enabled", True)))
-        if not re.fullmatch(r"[A-Za-z0-9_-]{1,24}", spec.name):
-            raise ValueError(f"{path}: имя '{spec.name}' — только латиница, цифры, _ и -, до 24 символов")
-        if spec.name in seen:
-            raise ValueError(f"{path}: имя '{spec.name}' повторяется")
-        if spec.multiplier <= 0:
-            raise ValueError(f"{path}: multiplier у '{spec.name}' должен быть > 0")
-        if spec.enabled and not (spec.api_key and spec.api_secret):
-            raise ValueError(f"{path}: у '{spec.name}' пустые api_key/api_secret")
-        seen.add(spec.name)
-        if spec.enabled:
-            specs.append(spec)
-    return specs
+    return parse_specs(rows, path)
 
 
 # ---------- чистое планирование ----------

@@ -4,9 +4,11 @@ import dataclasses
 import logging
 import signal
 import sys
+import threading
 from datetime import datetime
 
 from bot.bybit_client import BybitClient
+from bot.accounts import load_main
 from bot.config import Config
 from bot.followers import Copier, install_account_filter
 from bot.logsetup import setup_logging
@@ -25,6 +27,9 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg = Config.from_env()
+    main_keys = load_main(cfg.followers_path)   # ключи из веб-интерфейса приоритетнее .env
+    if main_keys:
+        cfg = dataclasses.replace(cfg, **main_keys)
     if args.live:
         cfg = dataclasses.replace(cfg, dry_run=False)
     if args.reset_day:
@@ -40,10 +45,18 @@ def main() -> None:
         run_diag(BybitClient(cfg.api_key, cfg.api_secret, cfg.testnet, cfg.base_url), cfg, get_tz(cfg.timezone))
         return
     setup_logging(cfg.log_dir, get_tz(cfg.timezone), cfg.log_retention_days)
-    if not cfg.api_key or not cfg.api_secret:
-        sys.exit("Заполните BYBIT_API_KEY и BYBIT_API_SECRET в .env")
-
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))  # чистая остановка на сервере
+    if cfg.ui_password and not args.once:
+        from bot import webui
+        webui.start(cfg.followers_path, cfg.ui_password, cfg.ui_host, cfg.ui_port)
+    if not cfg.api_key or not cfg.api_secret:
+        if cfg.ui_password and not args.once:
+            logging.getLogger("main").warning("Ключи основного счёта не заданы — откройте веб-интерфейс и сохраните их")
+            try:
+                threading.Event().wait()   # ждём сохранения настроек: оно перезапустит процесс
+            except KeyboardInterrupt:
+                return
+        sys.exit("Заполните BYBIT_API_KEY и BYBIT_API_SECRET в .env (или в веб-интерфейсе)")
     store = StateStore(cfg.state_path)
     client = BybitClient(cfg.api_key, cfg.api_secret, cfg.testnet, cfg.base_url)
     bot = Bot(client, cfg, store)

@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Счета бота</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1c2128; --muted:#667085; --line:#e3e6eb; --accent:#2457d6;
+          --ok:#14803c; --err:#b42318; --warn:#9a6700; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0f1318; --card:#181d24; --text:#e8ebef; --muted:#8b95a3; --line:#2a313b; --accent:#6c93f5;
+            --ok:#4ac27a; --err:#f2766b; --warn:#e3b341; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.45 -apple-system,system-ui,Segoe UI,Roboto,sans-serif; }
+  main { max-width:860px; margin:0 auto; padding:24px 16px 96px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:14px; }
+  .card h2 { font-size:16px; margin:0 0 12px; display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:10px; }
+  label { display:block; font-size:12px; color:var(--muted); margin-bottom:3px; }
+  input[type=text], input[type=password], input[type=number] {
+    width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:8px;
+    background:var(--bg); color:var(--text); font:inherit; }
+  input:focus { outline:2px solid var(--accent); outline-offset:-1px; }
+  .checks { display:flex; flex-wrap:wrap; gap:14px; margin-top:10px; font-size:14px; }
+  .checks label { display:flex; align-items:center; gap:6px; color:var(--text); font-size:14px; margin:0; }
+  button { font:inherit; padding:8px 14px; border-radius:8px; border:1px solid var(--line); background:var(--card);
+           color:var(--text); cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+  button.danger { color:var(--err); }
+  button:disabled { opacity:.55; cursor:default; }
+  .row { display:flex; gap:10px; align-items:center; margin-top:10px; flex-wrap:wrap; }
+  .status { font-size:13px; }
+  .ok { color:var(--ok); } .err { color:var(--err); } .warn { color:var(--warn); }
+  .hint { color:var(--muted); font-size:13px; margin-top:6px; }
+  .bar { position:fixed; left:0; right:0; bottom:0; background:var(--card); border-top:1px solid var(--line);
+         padding:12px 16px; }
+  .bar .in { max-width:860px; margin:0 auto; display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  .tag { font-size:12px; color:var(--muted); border:1px solid var(--line); border-radius:99px; padding:1px 8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Счета бота</h1>
+  <p class="sub">Основной счёт ведёт торговлю. Копирующие счета повторяют его позиции пропорционально размеру депозита.</p>
+
+  <section class="card">
+    <h2>Основной счёт</h2>
+    <div class="grid">
+      <div><label>API Key</label><input type="text" id="m_key" autocomplete="off" spellcheck="false"></div>
+      <div><label>API Secret</label><input type="password" id="m_secret" autocomplete="new-password"></div>
+    </div>
+    <div class="checks"><label><input type="checkbox" id="m_test"> Testnet</label></div>
+    <div class="row">
+      <button id="m_check">Проверить</button><span class="status" id="m_status"></span>
+    </div>
+  </section>
+
+  <div id="list"></div>
+  <button id="add">+ Добавить копирующий счёт</button>
+  <p class="hint">Копирующий счёт должен быть выделенным: любая его позиция, которой нет на основном счёте, будет закрыта.
+    Права ключей: ордера и позиции деривативов + чтение счёта, без вывода средств. Режим «только лог» (dry-run) —
+    бот пишет в лог, какие ордера поставил бы, но не отправляет их.</p>
+</main>
+
+<div class="bar"><div class="in">
+  <button class="primary" id="save">Сохранить</button>
+  <span class="status" id="save_status">После сохранения бот автоматически перезапустится.</span>
+</div></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const H = {"Content-Type": "application/json", "X-Requested-With": "m2p"};
+let followers = [];
+
+async function api(path, body) {
+  const r = await fetch(path, body ? {method: "POST", headers: H, body: JSON.stringify(body)} : {});
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+  return j;
+}
+function say(el, text, cls) { el.textContent = text; el.className = "status " + (cls || ""); }
+
+function render() {
+  const box = $("list");
+  box.innerHTML = "";
+  followers.forEach((f, i) => {
+    const c = document.createElement("section");
+    c.className = "card";
+    c.innerHTML = `
+      <h2><span>Копия <span class="tag"></span></span><button class="danger" data-act="del">Удалить</button></h2>
+      <div class="grid">
+        <div><label>Имя (латиница, цифры, _ -)</label><input type="text" data-f="name" spellcheck="false"></div>
+        <div><label>API Key</label><input type="text" data-f="api_key" autocomplete="off" spellcheck="false"></div>
+        <div><label>API Secret</label><input type="password" data-f="api_secret" autocomplete="new-password"></div>
+        <div><label>Множитель размера (1 = строго по депозиту)</label><input type="number" data-f="multiplier" step="0.1" min="0.01"></div>
+      </div>
+      <div class="checks">
+        <label><input type="checkbox" data-f="enabled"> Включён</label>
+        <label><input type="checkbox" data-f="dry_run"> Только лог (dry-run)</label>
+        <label><input type="checkbox" data-f="testnet"> Testnet</label>
+      </div>
+      <div class="row"><button data-act="check">Проверить</button><span class="status"></span></div>`;
+    c.querySelector(".tag").textContent = "#" + (i + 1);
+    c.querySelectorAll("[data-f]").forEach((el) => {
+      const k = el.dataset.f;
+      if (el.type === "checkbox") el.checked = !!f[k];
+      else if (k === "api_secret") el.placeholder = f.has_secret ? "•••••• сохранён (оставьте пустым)" : "";
+      else el.value = f[k] ?? "";
+      el.addEventListener("input", () => { f[k] = el.type === "checkbox" ? el.checked : el.value; });
+    });
+    c.querySelector('[data-act="del"]').onclick = () => {
+      if (confirm("Удалить «" + (f.name || "без имени") + "»?")) { followers.splice(i, 1); render(); }
+    };
+    c.querySelector('[data-act="check"]').onclick = async (e) => {
+      const st = c.querySelector(".row .status");
+      e.target.disabled = true; say(st, "Проверяю…");
+      try {
+        const r = await api("/api/check", {name: f.name, api_key: f.api_key, api_secret: f.api_secret || "",
+                                           testnet: !!f.testnet});
+        r.ok ? say(st, "Ключи верны, equity " + r.equity.toFixed(2) + " USDT", "ok") : say(st, r.error, "err");
+      } catch (err) { say(st, err.message, "err"); }
+      e.target.disabled = false;
+    };
+    box.appendChild(c);
+  });
+}
+
+$("add").onclick = () => {
+  let n = followers.length + 1;
+  while (followers.some((f) => f.name === "acc" + n)) n++;
+  followers.push({name: "acc" + n, api_key: "", api_secret: "", has_secret: false,
+                  testnet: false, multiplier: 1, dry_run: true, enabled: true});
+  render();
+};
+
+$("m_check").onclick = async (e) => {
+  e.target.disabled = true; say($("m_status"), "Проверяю…");
+  try {
+    const r = await api("/api/check", {name: "main", api_key: $("m_key").value, api_secret: $("m_secret").value,
+                                       testnet: $("m_test").checked});
+    r.ok ? say($("m_status"), "Ключи верны, equity " + r.equity.toFixed(2) + " USDT", "ok") : say($("m_status"), r.error, "err");
+  } catch (err) { say($("m_status"), err.message, "err"); }
+  e.target.disabled = false;
+};
+
+$("save").onclick = async (e) => {
+  e.target.disabled = true; say($("save_status"), "Сохраняю…");
+  try {
+    await api("/api/config", {
+      main: {api_key: $("m_key").value, api_secret: $("m_secret").value, testnet: $("m_test").checked},
+      followers: followers.map((f) => ({name: f.name, api_key: f.api_key, api_secret: f.api_secret || "",
+        testnet: !!f.testnet, multiplier: parseFloat(f.multiplier) || 1, dry_run: !!f.dry_run, enabled: f.enabled !== false})),
+    });
+    say($("save_status"), "Сохранено. Бот перезапускается…", "ok");
+    setTimeout(load, 6000);
+  } catch (err) { say($("save_status"), "Не сохранено: " + err.message, "err"); }
+  e.target.disabled = false;
+};
+
+async function load() {
+  try {
+    const c = await api("/api/config");
+    $("m_key").value = c.main.api_key; $("m_secret").value = "";
+    $("m_secret").placeholder = c.main.has_secret ? "•••••• сохранён (оставьте пустым)" : "";
+    $("m_test").checked = c.main.testnet;
+    followers = c.followers;
+    render();
+    say($("save_status"), "После сохранения бот автоматически перезапустится.");
+  } catch (err) { say($("save_status"), "Не удалось загрузить: " + err.message, "err"); }
+}
+load();
+</script>
+</body>
+</html>

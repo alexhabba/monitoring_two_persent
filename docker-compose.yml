@@ -8,6 +8,9 @@ services:
     environment:            # приоритетнее env_file: состояние и логи всегда в смонтированном томе
       DATA_DIR: /data
       LOG_DIR: /data/logs
+      UI_HOST: 0.0.0.0      # внутри контейнера; наружу порт открыт только на localhost сервера (см. ports)
+    ports:
+      - "127.0.0.1:8080:8080"   # веб-интерфейс настроек: только через SSH-туннель
     volumes:
       - ./data:/data        # SQLite-состояние и логи (переживают пересоздание контейнера)
     stop_grace_period: 20s

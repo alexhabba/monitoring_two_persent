@@ -57,6 +57,9 @@ class Config:
     copy_tick_sec: float = 1.0
     copy_ratio_refresh_sec: float = 60.0
     copy_deadband_pct: float = 3.0       # не дёргаем позицию из-за расхождения меньше N% от нужного размера
+    ui_password: str = ""               # пусто = веб-интерфейс настроек выключен
+    ui_host: str = "127.0.0.1"
+    ui_port: int = 8080
 
     @property
     def state_path(self) -> str:
@@ -98,6 +101,9 @@ class Config:
             copy_tick_sec=_float("COPY_TICK_SEC", 1.0),
             copy_ratio_refresh_sec=_float("COPY_RATIO_REFRESH_SEC", 60.0),
             copy_deadband_pct=_float("COPY_DEADBAND_PCT", 3.0),
+            ui_password=_str("UI_PASSWORD", ""),
+            ui_host=_str("UI_HOST", "127.0.0.1"),
+            ui_port=int(_float("UI_PORT", 8080)),
         )
         cfg.validate()
         return cfg

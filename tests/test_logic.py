@@ -701,3 +701,78 @@ def test_follower_dry_run_places_nothing(tmp_path):
     f = make_follower(tmp_path, cl, dry_run=True)
     f._sync([PositionView("BTCUSDT", "Buy", 10.0, 100.0, 100.0, 0.0, 0, 1.0, leverage=5.0)], 100.0)
     assert cl.placed == [] and cl.leverage_calls == []
+
+
+# ---------- хранение ключей и веб-интерфейс ----------
+import base64 as _b64  # noqa: E402
+import json as _json  # noqa: E402
+import urllib.error  # noqa: E402
+import urllib.request  # noqa: E402
+
+from bot import accounts, webui  # noqa: E402
+
+
+def test_accounts_keep_old_secret_when_blank_and_hide_secrets(tmp_path):
+    path = str(tmp_path / "followers.json")
+    accounts.save(path, {"main": {"api_key": "MK", "api_secret": "MS"},
+                         "followers": [{"name": "a1", "api_key": "K1", "api_secret": "S1", "multiplier": 2}]})
+    accounts.save(path, {"main": {"api_key": "MK", "api_secret": ""},
+                         "followers": [{"name": "a1", "api_key": "K1b", "api_secret": ""},
+                                       {"name": "a2", "api_key": "K2", "api_secret": "S2", "dry_run": True}]})
+    raw = accounts.read_raw(path)
+    assert raw["main"]["api_secret"] == "MS" and raw["followers"][0]["api_secret"] == "S1"
+    assert raw["followers"][0]["api_key"] == "K1b" and raw["followers"][1]["dry_run"] is True
+    pub = _json.dumps(accounts.public_view(raw))
+    assert "MS" not in pub and "S1" not in pub and "S2" not in pub
+    assert accounts.load_main(path) == {"api_key": "MK", "api_secret": "MS", "testnet": False}
+    assert (os.stat(path).st_mode & 0o777) == 0o600
+    assert [s.name for s in load_specs(path)] == ["a1", "a2"]
+
+
+def test_accounts_validation(tmp_path):
+    path = str(tmp_path / "f.json")
+    for bad in ({"followers": [{"name": "x y", "api_key": "k", "api_secret": "s"}]},
+                {"followers": [{"name": "a", "api_key": "k", "api_secret": "s"},
+                               {"name": "a", "api_key": "k", "api_secret": "s"}]},
+                {"followers": [{"name": "a", "api_key": "k", "api_secret": ""}]},
+                {"main": {"api_key": "only-key"}, "followers": []}):
+        try:
+            accounts.save(path, bad)
+            assert False, bad
+        except ValueError:
+            pass
+    assert not os.path.exists(path)   # при ошибке файл не создаётся
+
+
+def test_webui_auth_csrf_and_save(tmp_path):
+    path = str(tmp_path / "followers.json")
+    restarted = []
+    srv = webui.start(path, "pw", "127.0.0.1", 0, restart=lambda: restarted.append(1))
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    auth = "Basic " + _b64.b64encode(b"u:pw").decode()
+
+    def call(url, body=None, headers=None):
+        req = urllib.request.Request(base + url, data=_json.dumps(body).encode() if body is not None else None,
+                                     headers=headers or {})
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+    try:
+        assert call("/api/config")[0] == 401
+        assert call("/api/config", headers={"Authorization": "Basic " + _b64.b64encode(b"u:bad").decode()})[0] == 401
+        st, html = call("/", headers={"Authorization": auth})
+        assert st == 200 and "Сохранить".encode() in html
+        body = {"main": {"api_key": "MK", "api_secret": "MS"}, "followers": []}
+        assert call("/api/config", body, {"Authorization": auth})[0] == 403          # без X-Requested-With
+        assert restarted == [] and not os.path.exists(path)
+        st, out = call("/api/config", body, {"Authorization": auth, "X-Requested-With": "m2p"})
+        assert st == 200 and restarted == [1] and accounts.load_main(path)["api_secret"] == "MS"
+        st, out = call("/api/config", headers={"Authorization": auth})
+        assert st == 200 and b"MS" not in out and _json.loads(out)["main"]["has_secret"] is True
+        st, out = call("/api/config", {"followers": [{"name": "bad name"}]},
+                       {"Authorization": auth, "X-Requested-With": "m2p"})
+        assert st == 400 and restarted == [1]
+    finally:
+        srv.shutdown()
