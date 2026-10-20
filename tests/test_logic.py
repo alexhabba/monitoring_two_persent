@@ -551,3 +551,153 @@ def test_diag_runs_and_reports_unusable_base(tmp_path):
     run_diag(cl, cfg(), MSK, out=lines.append)
     text = "\n".join(lines)
     assert "TRANSFER_IN" in text and "на 00:00 счёт был пуст" in text
+
+
+# ---------- копирование на другие счета ----------
+from bot.followers import Action, Follower, FollowerSpec, chunk_for, load_specs, plan_action  # noqa: E402
+
+STEP, MINQ = Decimal("0.001"), Decimal("0.001")
+
+
+def act(desired, current, db=3.0):
+    return plan_action(desired, current, STEP, MINQ, db)
+
+
+def test_copy_opens_from_zero_long_and_short():
+    a = act(10.0, 0.0)
+    assert (a.side, a.need, a.reduce_only) == ("Buy", Decimal("10.000"), False)
+    a = act(-4.0, 0.0)
+    assert (a.side, a.need, a.reduce_only) == ("Sell", Decimal("4.000"), False)
+
+
+def test_copy_adds_only_the_missing_part_and_respects_deadband():
+    a = act(10.0, 6.0)
+    assert (a.side, a.need, a.reduce_only) == ("Buy", Decimal("4.000"), False)
+    assert act(10.0, 9.9) is None          # 1% < допуска 3%
+    assert act(10.0, 10.0) is None
+
+
+def test_copy_reduces_and_closes_with_reduce_only():
+    a = act(4.0, 10.0)
+    assert (a.side, a.need, a.reduce_only) == ("Sell", Decimal("6.000"), True)
+    a = act(-4.0, -10.0)
+    assert (a.side, a.need, a.reduce_only) == ("Buy", Decimal("6.000"), True)
+    a = act(0.0, 7.5)                        # основной закрыт — копия закрывается целиком, допуск не мешает
+    assert (a.side, a.need, a.reduce_only) == ("Sell", Decimal("7.500"), True)
+    assert act(0.0, 0.0) is None
+
+
+def test_copy_flip_first_exits_whole_position():
+    a = act(-5.0, 3.0)
+    assert (a.side, a.need, a.reduce_only) == ("Sell", Decimal("3.000"), True)
+
+
+def test_copy_tiny_target_below_min_qty_is_flat():
+    assert act(0.0004, 0.0) is None
+    a = act(0.0004, 1.0)
+    assert a.reduce_only and a.need == Decimal("1.0")
+
+
+def test_copy_chunk_is_fraction_of_depth_and_opens_on_own_side():
+    c = cfg(book_fraction=0.1)
+    plan = chunk_for(Action("Buy", Decimal("50"), False), BOOK, INSTR, c)
+    assert plan.side == "Buy" and plan.price == 100.0    # лонг открываем по best bid — мейкер
+    assert plan.qty == Decimal("1.000")                  # 10% от глубины asks (10)
+    plan = chunk_for(Action("Sell", Decimal("50"), False), BOOK, INSTR, c)
+    assert plan.price == 100.1
+
+
+def test_copy_chunk_skips_below_min_notional_and_wide_spread():
+    assert chunk_for(Action("Buy", Decimal("0.01"), False), BOOK, {**INSTR, "min_notional": 5.0}, cfg()) is None
+    wide = {"bids": [(100.0, 5)], "asks": [(101.0, 5)]}
+    assert chunk_for(Action("Buy", Decimal("1"), False), wide, INSTR, cfg(max_spread_bps=20)) is None
+
+
+def test_load_specs(tmp_path):
+    f = tmp_path / "f.json"
+    assert load_specs(str(f)) == []
+    f.write_text('{"followers":[{"name":"a1","api_key":"k","api_secret":"s"},'
+                 '{"name":"off","api_key":"","api_secret":"","enabled":false}]}')
+    specs = load_specs(str(f))
+    assert [s.name for s in specs] == ["a1"] and specs[0].multiplier == 1.0
+    f.write_text('[{"name":"bad name","api_key":"k","api_secret":"s"}]')
+    try:
+        load_specs(str(f))
+        assert False
+    except ValueError:
+        pass
+
+
+class CopyFake:
+    """Минимальная биржа для копии: позиции, equity, стакан, ордера."""
+
+    def __init__(self, equity, size=0.0, side="Buy"):
+        self.equity, self.size, self.side = equity, size, side
+        self.placed, self.leverage_calls = [], []
+        self.orders = {}
+
+    def get_equity(self, t):
+        return self.equity
+
+    def get_positions(self, category, settle):
+        if self.size <= 0:
+            return []
+        return [{"symbol": "BTCUSDT", "side": self.side, "size": str(self.size), "avgPrice": "100",
+                 "markPrice": "100", "positionIdx": 0, "positionIM": "1", "leverage": "5"}]
+
+    def get_orderbook(self, c, s, limit=50):
+        return BOOK
+
+    def get_instrument(self, c, s):
+        return {**INSTR, "min_notional": 5.0}
+
+    def get_margin_mode(self):
+        return "REGULAR_MARGIN"
+
+    def set_leverage(self, c, s, lev):
+        self.leverage_calls.append((s, lev))
+
+    def place_limit_order(self, c, s, side, qty, price, idx, link, reduce_only):
+        self.placed.append((side, qty, price, reduce_only))
+        self.orders[f"o{len(self.placed)}"] = {"orderStatus": "New"}
+        return f"o{len(self.placed)}"
+
+    def get_order(self, c, s, oid):
+        return self.orders.get(oid)
+
+    def cancel_order(self, c, s, oid):
+        self.orders[oid] = {"orderStatus": "Cancelled"}
+
+
+def make_follower(tmp_path, client, **kw):
+    spec = FollowerSpec("acc2", "k", "s")
+    f = Follower(spec, cfg(data_dir=str(tmp_path), book_fraction=0.1, **kw), client=client)
+    f._last_eval = 1e18       # шаг дневной цели в этих тестах не нужен
+    f.store.create_day(f.bot.clock().date().isoformat(), 1000.0, 0.0, "t", "first_run", 2.0)
+    return f
+
+
+def test_follower_opens_proportionally_with_leverage_and_waits_for_pending(tmp_path):
+    cl = CopyFake(equity=1000.0)
+    f = make_follower(tmp_path, cl)
+    main = [PositionView("BTCUSDT", "Buy", 10.0, 100.0, 100.0, 0.0, 0, 1.0, leverage=5.0)]
+    f._sync(main, 100.0)                       # equity 1000 / 100 = ×10 -> нужно 100
+    assert f.ratio == 10.0
+    assert cl.leverage_calls == [("BTCUSDT", 5.0)]
+    assert cl.placed == [("Buy", "1", "100", False)]    # кусок 10% глубины, лимит по best bid
+    f._sync(main, 100.0)                       # ордер ещё висит — второй не ставим
+    assert len(cl.placed) == 1
+
+
+def test_follower_mirrors_main_close_with_reduce_only(tmp_path):
+    cl = CopyFake(equity=1000.0, size=100.0)
+    f = make_follower(tmp_path, cl)
+    f._sync([], 100.0)                         # основной закрыт
+    assert cl.placed and cl.placed[0][0] == "Sell" and cl.placed[0][3] is True
+
+
+def test_follower_dry_run_places_nothing(tmp_path):
+    cl = CopyFake(equity=1000.0)
+    f = make_follower(tmp_path, cl, dry_run=True)
+    f._sync([PositionView("BTCUSDT", "Buy", 10.0, 100.0, 100.0, 0.0, 0, 1.0, leverage=5.0)], 100.0)
+    assert cl.placed == [] and cl.leverage_calls == []

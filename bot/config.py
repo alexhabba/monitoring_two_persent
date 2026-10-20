@@ -52,6 +52,11 @@ class Config:
     max_spread_bps: float = 20.0
     order_timeout_sec: float = 15.0
     book_limit: int = 50
+    # --- копирование позиций на другие счета ---
+    followers_file: str = ""            # JSON со списком счетов; пусто = {data_dir}/followers.json
+    copy_tick_sec: float = 1.0
+    copy_ratio_refresh_sec: float = 60.0
+    copy_deadband_pct: float = 3.0       # не дёргаем позицию из-за расхождения меньше N% от нужного размера
 
     @property
     def state_path(self) -> str:
@@ -59,6 +64,10 @@ class Config:
         mode = "dry" if self.dry_run else "live"
         # у DRY-RUN и боевого режима разные файлы: «цель выполнена» из теста не должна влиять на боевой режим
         return f"{self.data_dir}/state_{net}_{mode}.db"
+
+    @property
+    def followers_path(self) -> str:
+        return self.followers_file or f"{self.data_dir}/followers.json"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -85,6 +94,10 @@ class Config:
             book_fraction=_float("BOOK_FRACTION", 0.10),
             max_spread_bps=_float("MAX_SPREAD_BPS", 20.0),
             order_timeout_sec=_float("ORDER_TIMEOUT_SEC", 15.0),
+            followers_file=_str("FOLLOWERS_FILE", ""),
+            copy_tick_sec=_float("COPY_TICK_SEC", 1.0),
+            copy_ratio_refresh_sec=_float("COPY_RATIO_REFRESH_SEC", 60.0),
+            copy_deadband_pct=_float("COPY_DEADBAND_PCT", 3.0),
         )
         cfg.validate()
         return cfg

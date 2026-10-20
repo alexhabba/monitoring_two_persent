@@ -15,6 +15,8 @@ TESTNET = "https://api-testnet.bybit.com"
 
 # Ошибки, при которых отмену/повторную отмену можно спокойно игнорировать
 ORDER_GONE_CODES = {110001, 170213, 170142}
+# Плечо уже такое, какое просили
+LEVERAGE_NOT_MODIFIED = 110043
 
 
 class BybitError(Exception):
@@ -161,19 +163,39 @@ class BybitClient:
             "min_qty": float(row["lotSizeFilter"]["minOrderQty"]),
             "qty_step": row["lotSizeFilter"]["qtyStep"],  # строкой — для Decimal
             "tick_size": row["priceFilter"]["tickSize"],
+            "min_notional": float(row["lotSizeFilter"].get("minNotionalValue") or 5),
         }
 
     # ---------- ордера ----------
+    def place_limit_order(self, category: str, symbol: str, side: str, qty: str, price: str,
+                          position_idx: int, link_id: str, reduce_only: bool) -> str:
+        """Post-only лимитка: всегда мейкер. reduce_only=True — не может открыть/перевернуть позицию."""
+        body = {
+            "category": category, "symbol": symbol, "side": side,
+            "orderType": "Limit", "qty": qty, "price": price,
+            "timeInForce": "PostOnly", "positionIdx": position_idx, "orderLinkId": link_id,
+        }
+        if reduce_only:
+            body["reduceOnly"] = True
+        return self._request("POST", "/v5/order/create", body=body)["orderId"]
+
     def place_limit_close(self, category: str, symbol: str, side: str, qty: str,
                           price: str, position_idx: int, link_id: str) -> str:
         """Post-only reduce-only лимитка: гарантированно мейкер и не может открыть позицию."""
-        res = self._request("POST", "/v5/order/create", body={
-            "category": category, "symbol": symbol, "side": side,
-            "orderType": "Limit", "qty": qty, "price": price,
-            "timeInForce": "PostOnly", "reduceOnly": True,
-            "positionIdx": position_idx, "orderLinkId": link_id,
-        })
-        return res["orderId"]
+        return self.place_limit_order(category, symbol, side, qty, price, position_idx, link_id, True)
+
+    def set_leverage(self, category: str, symbol: str, leverage: float) -> None:
+        lev = format(leverage, "g")
+        try:
+            self._request("POST", "/v5/position/set-leverage", body={
+                "category": category, "symbol": symbol, "buyLeverage": lev, "sellLeverage": lev})
+        except BybitError as e:
+            if e.code != LEVERAGE_NOT_MODIFIED:
+                raise
+
+    def get_margin_mode(self) -> str:
+        """REGULAR_MARGIN (кросс) | ISOLATED_MARGIN | PORTFOLIO_MARGIN."""
+        return self._request("GET", "/v5/account/info").get("marginMode", "")
 
     def cancel_order(self, category: str, symbol: str, order_id: str) -> None:
         try:

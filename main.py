@@ -8,6 +8,7 @@ from datetime import datetime
 
 from bot.bybit_client import BybitClient
 from bot.config import Config
+from bot.followers import Copier, install_account_filter
 from bot.logsetup import setup_logging
 from bot.monitor import Bot
 from bot.state import StateStore
@@ -46,14 +47,19 @@ def main() -> None:
     store = StateStore(cfg.state_path)
     client = BybitClient(cfg.api_key, cfg.api_secret, cfg.testnet, cfg.base_url)
     bot = Bot(client, cfg, store)
+    copier = None
     try:
         if args.once:
             bot.step()
         else:
-            bot.run()
+            install_account_filter()
+            copier = Copier.from_config(client, cfg)
+            bot.run(copier)
     except KeyboardInterrupt:
         logging.getLogger("main").info("Остановлено.")
     finally:
+        if copier is not None:
+            copier.close()
         store.close()
 
 

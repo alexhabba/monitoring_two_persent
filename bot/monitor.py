@@ -188,7 +188,7 @@ class Bot:
             log.exception("Ошибка при закрытии %s", p.symbol)
 
     # ---------- цикл ----------
-    def run(self) -> None:
+    def run(self, copier=None) -> None:
         mode = "DRY-RUN (ордера не отправляются)" if self.cfg.dry_run else "БОЕВОЙ РЕЖИМ"
         log.info("Старт. Режим: %s | testnet=%s | цель +%.2f%% в день | пояс %s | состояние: %s",
                  mode, self.cfg.testnet, self.cfg.target_profit_pct, self.cfg.timezone, self.cfg.state_path)
@@ -198,4 +198,14 @@ class Bot:
             except Exception:
                 log.exception("Ошибка шага мониторинга")
             fast = self.closing and not self.cfg.dry_run
-            time.sleep(self.cfg.close_loop_sleep_sec if fast else self.cfg.poll_interval_sec)
+            end = time.monotonic() + (self.cfg.close_loop_sleep_sec if fast else self.cfg.poll_interval_sec)
+            while True:   # между шагами основного счёта копии сверяются каждую секунду
+                if copier is not None:
+                    try:
+                        copier.tick()
+                    except Exception:
+                        log.exception("Ошибка копирования")
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(self.cfg.copy_tick_sec, remaining) if copier is not None else remaining)

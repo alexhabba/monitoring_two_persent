@@ -29,10 +29,15 @@ class PositionView:
     position_idx: int
     position_im: float
     unrealised_pnl: float = 0.0
+    leverage: float = 0.0
 
     @property
     def key(self) -> Key:
         return (self.symbol, self.position_idx)
+
+    @property
+    def signed_size(self) -> float:
+        return self.size if self.side == "Buy" else -self.size
 
     @property
     def close_side(self) -> str:
@@ -50,6 +55,7 @@ def parse_position(raw: dict) -> PositionView:
         position_idx=int(raw.get("positionIdx") or 0),
         position_im=float(raw.get("positionIM") or 0),
         unrealised_pnl=float(raw.get("unrealisedPnl") or 0),
+        leverage=float(raw.get("leverage") or 0),
     )
 
 

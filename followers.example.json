@@ -1,0 +1,13 @@
+{
+  "followers": [
+    {
+      "name": "acc2",
+      "api_key": "",
+      "api_secret": "",
+      "testnet": false,
+      "multiplier": 1.0,
+      "dry_run": true,
+      "enabled": true
+    }
+  ]
+}
