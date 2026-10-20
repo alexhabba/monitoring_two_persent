@@ -170,7 +170,8 @@ class Follower:
         self.client = client or BybitClient(spec.api_key, spec.api_secret, spec.testnet, spec.base_url)
         net = "testnet" if spec.testnet else "mainnet"
         mode = "dry" if self.cfg.dry_run else "live"
-        self.store = StateStore(f"{cfg.data_dir}/state_{spec.name}_{net}_{mode}.db")
+        # шаги копии идут в потоке пула (по одному за раз — см. busy()), поэтому соединение не привязано к потоку
+        self.store = StateStore(f"{cfg.data_dir}/state_{spec.name}_{net}_{mode}.db", check_same_thread=False)
         self.bot = Bot(self.client, self.cfg, self.store)
         self.pending: dict[Key, Pending] = {}
         self.ratio = 0.0

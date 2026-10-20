@@ -776,3 +776,20 @@ def test_webui_auth_csrf_and_save(tmp_path):
         assert st == 400 and restarted == [1]
     finally:
         srv.shutdown()
+
+
+class MarginFake(FakeClient):
+    def get_margin_mode(self): return "REGULAR_MARGIN"
+
+
+def test_copier_tick_runs_followers_in_worker_threads_without_errors(tmp_path, caplog):
+    from bot.followers import Copier
+    main, fcl = MarginFake(), MarginFake(legs={0: ["Buy", 0.0, 100.0]}, base=1000.0)
+    f = Follower(FollowerSpec("acc2", "k", "s"), cfg(data_dir=str(tmp_path)), client=fcl)
+    cp = Copier(main, cfg(data_dir=str(tmp_path)), [f])
+    with caplog.at_level("ERROR"):
+        cp.tick()
+        f.future.result(timeout=10)       # реальный путь: шаг копии выполняется в потоке пула
+    cp.close()
+    assert not [r for r in caplog.records if "Ошибка" in r.getMessage()], caplog.text
+    assert f.store.conn is not None

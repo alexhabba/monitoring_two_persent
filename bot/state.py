@@ -32,12 +32,12 @@ CREATE TABLE IF NOT EXISTS events(
 
 
 class StateStore:
-    def __init__(self, path: str):
+    def __init__(self, path: str, check_same_thread: bool = True):
         d = os.path.dirname(path)
         if d:
             os.makedirs(d, exist_ok=True)
         self.path = path
-        self.conn = sqlite3.connect(path)
+        self.conn = sqlite3.connect(path, check_same_thread=check_same_thread)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
         self._migrate()
