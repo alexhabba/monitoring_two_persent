@@ -52,6 +52,8 @@ class Config:
     max_spread_bps: float = 20.0
     order_timeout_sec: float = 15.0
     book_limit: int = 50
+    close_workers: int = 8               # сколько позиций закрываем параллельно
+    momentum_windows_sec: tuple = (60.0, 120.0)   # окна для приоритета: у кого прибыль выросла сильнее — закрываем первой
     # --- копирование позиций на другие счета ---
     followers_file: str = ""            # JSON со списком счетов; пусто = {data_dir}/followers.json
     copy_tick_sec: float = 1.0

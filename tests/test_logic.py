@@ -157,6 +157,8 @@ class FakeClient:
         return f"oid{len(self.orders)}"
 
     def get_order(self, c, s, oid): return {"orderStatus": "Filled", "cumExecQty": self.orders[-1][1]}
+    def get_open_orders(self, category, settle): return []      # ордера этого фейка исполняются мгновенно
+    def amend_order(self, *a): pass
     def cancel_order(self, *a): pass
 
 
@@ -866,3 +868,108 @@ def test_rate_limit_pauses_follower(tmp_path):
     assert f._pause_until > 0
     f._sync = lambda *a, **k: (_ for _ in ()).throw(AssertionError("не должен вызываться во время паузы"))
     f.tick([], 100.0, "REGULAR_MARGIN")      # во время паузы шаг пропускается
+
+
+# ---------- быстрое закрытие: все позиции сразу, по приоритету, с переставлением ордера ----------
+import time as _time  # noqa: E402
+
+from bot.bybit_client import BybitError  # noqa: E402
+
+
+class MultiFake(FakeClient):
+    """Несколько монет: каждая «нога» legs[i] — отдельный символ C{i}USDT."""
+
+    def get_positions(self, category, settle):
+        out = super().get_positions(category, settle)
+        for r in out:
+            r["symbol"] = f"C{r['positionIdx']}USDT"
+        return out
+
+
+class RestingFake(MultiFake):
+    """Ордера на закрытие не исполняются мгновенно, а стоят в стакане (можно переставлять и снимать)."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.open, self.amended, self.cancelled = {}, [], []
+
+    def place_limit_close(self, category, symbol, side, qty, price, idx, link):
+        oid = f"o{len(self.orders) + 1}"
+        self.orders.append((side, qty, price, idx))
+        self.open[oid] = {"orderId": oid, "symbol": symbol, "positionIdx": idx, "price": price, "qty": qty,
+                          "leavesQty": qty, "orderLinkId": link, "reduceOnly": True}
+        return oid
+
+    def get_open_orders(self, category, settle): return list(self.open.values())
+
+    def amend_order(self, c, s, oid, price, qty):
+        self.amended.append((oid, price, qty))
+        self.open[oid].update(price=price, qty=qty)
+
+    def cancel_order(self, c, s, oid):
+        self.cancelled.append(oid)
+        self.open.pop(oid, None)
+
+
+def test_all_positions_get_an_order_in_the_same_step(tmp_path):
+    cl = MultiFake(legs={0: ["Buy", 3.0, 100.0], 1: ["Buy", 3.0, 100.0], 2: ["Buy", 3.0, 100.0]})
+    bot, store, clock = make_bot(cl, tmp_path)
+    bot.step()                         # база
+    cl.add_realized(20.0)              # цель достигнута
+    bot.step()
+    assert sorted(o[3] for o in cl.orders) == [0, 1, 2]     # по ордеру на КАЖДУЮ позицию за один шаг
+
+
+def test_closing_priority_goes_to_positions_with_the_biggest_recent_profit_growth(tmp_path):
+    cl = MultiFake(legs={0: ["Buy", 3.0, 100.0], 1: ["Buy", 3.0, 100.0], 2: ["Buy", 3.0, 100.0]})
+    bot, store, clock = make_bot(cl, tmp_path, close_workers=1)     # 1 поток — порядок отправки = приоритет
+    bot.step()
+    cl.mark = 104.0                    # у каждой позиции нереализованный +12
+    now = _time.monotonic()
+    # 70 секунд назад: у C1 было +2 (рост +10), у C2 +8 (рост +4), у C0 +11.5 (рост +0.5)
+    bot._hist.clear()
+    bot._hist.append((now - 70, {("C0USDT", 0): 11.5, ("C1USDT", 1): 2.0, ("C2USDT", 2): 8.0}))
+    bot.step()
+    assert [o[3] for o in cl.orders] == [1, 2, 0]
+
+
+def test_resting_order_is_kept_then_moved_closer_with_amend_not_cancel(tmp_path):
+    cl = RestingFake(legs={0: ["Buy", 50.0, 100.0]})
+    c = cfg(close_workers=1)
+    closer = PositionCloser(cl, c, sleep=lambda s: None)
+    p = pos(size=50.0)
+    p = PositionView("C0USDT", "Buy", 50.0, 100.0, 100.0, 0.0, 0, 10.0)
+    closer.close_all([p], {"C0USDT": make_book(100.0)})
+    assert len(cl.orders) == 1 and cl.orders[0][2] == "100.1"               # встали на лучшую цену продажи
+    closer.close_all([p], {"C0USDT": make_book(100.0)})
+    assert len(cl.orders) == 1 and not cl.amended                           # цена та же — ничего не трогаем
+    closer.close_all([p], {"C0USDT": make_book(99.8)})                      # рынок ушёл вниз: лучший ask теперь 99.9
+    assert len(cl.orders) == 1 and cl.amended and cl.amended[0][1] == "99.9" and not cl.cancelled
+
+
+def test_unlatching_goal_cancels_resting_close_orders(tmp_path):
+    cl = RestingFake(legs={0: ["Buy", 3.0, 100.0]})
+    bot, store, clock = make_bot(cl, tmp_path)
+    bot.step()
+    cl.mark = 104.0
+    bot.step()                         # цель, ордер на закрытие стоит в стакане
+    assert cl.open and bot.closer.resting
+    cl.mark = 100.5                    # результат упал ниже цели
+    bot.step()
+    assert not cl.open and cl.cancelled and not bot.closer.resting
+    assert store.get_day("2026-10-19")["goal_reached"] == 0
+
+
+def test_not_whitelisted_symbol_is_reported_clearly_and_does_not_crash(tmp_path, caplog):
+    cl = RestingFake(legs={0: ["Buy", 3.0, 100.0]})
+
+    def reject(*a, **k):
+        raise BybitError(10029, "The requested symbol is not whitelisted.", "/v5/order/create")
+    cl.place_limit_close = reject
+    closer = PositionCloser(cl, cfg(close_workers=1), sleep=lambda s: None)
+    p = PositionView("C0USDT", "Buy", 3.0, 100.0, 100.0, 0.0, 0, 10.0)
+    with caplog.at_level("ERROR"):
+        closer.close_all([p], {"C0USDT": make_book(100.0)})
+        closer.close_all([p], {"C0USDT": make_book(100.0)})    # вторая попытка: тот же текст в лог не повторяется
+    msgs = [r.getMessage() for r in caplog.records if "не удалось закрывать" in r.getMessage()]
+    assert len(msgs) == 1 and "whitelist" in msgs[0] and not closer.resting

@@ -23,7 +23,7 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 
 from .bybit_client import BybitClient, BybitError
-from .closer import ChunkPlan, FINAL, _fmt, _floor_to_step, book_depth
+from .closer import ChunkPlan, FINAL, _fmt, _floor_to_step, book_depth, fmt_price
 from .config import Config
 from .monitor import Bot
 from .pnl import Key, PositionView, best_prices, parse_position
@@ -301,7 +301,7 @@ class Follower:
         if not act.reduce_only and not cfg.dry_run and lev > 0 and self._lev.get(symbol) != lev:
             self.client.set_leverage(cfg.category, symbol, lev)   # плечо как на основном; не вышло — не открываем
             self._lev[symbol] = lev
-        price = repr(plan.price) if plan.price != int(plan.price) else str(int(plan.price))
+        price = fmt_price(plan.price, self._instrument(symbol)["tick_size"])
         text = (f"{symbol} {plan.side}{' reduce' if act.reduce_only else ''} qty={_fmt(plan.qty)} @ {price} "
                 f"(нужно {want:+.6g}, есть {cur:+.6g}, плечо {lev:g})")
         if cfg.dry_run:

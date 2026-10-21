@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from .bybit_client import BybitClient
 from .closer import PositionCloser
 from .config import Config
 from .daypnl import INCLUDED_TYPES, DayPnlTracker
-from .pnl import Evaluation, PositionView, evaluate, parse_position
+from .pnl import Evaluation, Key, PositionView, evaluate, parse_position
 from .state import StateStore
 from .timeutil import get_tz
 
@@ -27,7 +29,10 @@ class Bot:
         self.clock = clock or (lambda: datetime.now(self.tz))
         self.tracker = DayPnlTracker(client, cfg)
         self._fee_cache: dict[str, tuple[float, float]] = {}
-        self._rr = 0
+        self._last_priority: list[str] = []
+        self._priority_at = 0.0
+        self._goal_log_at = 0.0
+        self._hist: deque[tuple[float, dict[Key, float]]] = deque()   # (monotonic, {позиция: нереализованный PnL})
         self._pending_final = False  # закрывали позиции после цели — нужно записать итог дня
         self.closing = False
 
@@ -94,11 +99,42 @@ class Bot:
         self._pending_final = False
         return self.store.get_day(day)
 
+    def _books(self, symbols: set[str]) -> dict[str, dict]:
+        if len(symbols) <= 1:
+            return {s: self.client.get_orderbook(self.cfg.category, s, self.cfg.book_limit) for s in symbols}
+        with ThreadPoolExecutor(max_workers=min(len(symbols), 8)) as ex:   # стаканы всех монет сразу, а не по очереди
+            futs = {s: ex.submit(self.client.get_orderbook, self.cfg.category, s, self.cfg.book_limit) for s in symbols}
+            return {s: f.result() for s, f in futs.items()}
+
+    def _remember(self, positions: list[PositionView]) -> None:
+        """Запоминаем нереализованный PnL позиций — по нему считаем, у кого прибыль растёт быстрее всех."""
+        now = time.monotonic()
+        self._hist.append((now, {p.key: p.unrealised_pnl for p in positions}))
+        horizon = max(self.cfg.momentum_windows_sec) + 60
+        while self._hist and now - self._hist[0][0] > horizon:
+            self._hist.popleft()
+
+    def _momentum(self, p: PositionView, now: float) -> float:
+        """Рост нереализованной прибыли позиции за последние 1–2 минуты (USDT): чем больше, тем раньше закрываем."""
+        scores = []
+        for w in self.cfg.momentum_windows_sec:
+            old = None
+            for ts, snap in self._hist:        # самый свежий снимок не новее now − w
+                if ts <= now - w and p.key in snap:
+                    old = snap[p.key]
+            if old is None:                    # истории меньше окна — берём самый старый снимок, если ему хотя бы 15 с
+                for ts, snap in self._hist:
+                    if now - ts >= 15 and p.key in snap:
+                        old = snap[p.key]
+                        break
+            if old is not None:
+                scores.append(p.unrealised_pnl - old)
+        return max(scores) if scores else 0.0
+
     def _evaluate(self, day: dict, now: datetime, positions: list[PositionView],
                   equity: float) -> tuple[Evaluation, dict[str, dict]]:
         """Результат дня «как если бы всё закрыли сейчас». Ошибка лога транзакций — исключение, т.е. без решения."""
-        books = {s: self.client.get_orderbook(self.cfg.category, s, self.cfg.book_limit)
-                 for s in {p.symbol for p in positions}}
+        books = self._books({p.symbol for p in positions})
         fees = {s: self._taker_fee(s) for s in books}
         start_ms = int(datetime.fromisoformat(day["start_ts"]).timestamp() * 1000)
         realized = self.tracker.realized(day["day"], start_ms, self._now_ms(now))
@@ -116,6 +152,7 @@ class Bot:
 
         equity = self.client.get_equity(cfg.account_type)
         positions = [parse_position(r) for r in self.client.get_positions(cfg.category, cfg.settle_coin)]
+        self._remember(positions)
         day = self._ensure_day(now, equity, sum(p.unrealised_pnl for p in positions))
 
         ev, books = self._evaluate(day, now, positions, equity)
@@ -139,7 +176,7 @@ class Bot:
 
         if goal and positions:
             self._pending_final = True
-            self._close_one_chunk(positions, books)
+            self._close_all(positions, books)
         return ev
 
     def _goal_step(self, row: dict, now: datetime) -> Evaluation:
@@ -148,9 +185,10 @@ class Bot:
         Если позиций нет — раз в шаг тоже проверяем, что результат (уже реализованный) не ниже цели."""
         cfg = self.cfg
         positions = [parse_position(r) for r in self.client.get_positions(cfg.category, cfg.settle_coin)]
-        equity = self.client.get_equity(cfg.account_type)
-        ev, books = self._evaluate(row, now, positions, equity)
+        self._remember(positions)
+        ev, books = self._evaluate(row, now, positions, 0.0)
         if ev.pct < cfg.target_profit_pct:
+            self.closer.cancel_all()    # живые ордера на закрытие больше не нужны: цель снята
             self.store.clear_goal(row["day"])
             self.store.add_event(row["day"], now.isoformat(), "goal_lost",
                                  f"результат дня {ev.gain:+.4f} USDT = {ev.pct:.3f}% < цели {cfg.target_profit_pct:.2f}% "
@@ -166,9 +204,11 @@ class Bot:
         if positions:
             self.closing = True
             self._pending_final = True
-            log.info("%s | цель дня выполнена (результат %+.4f = %.3f%% >= %.2f%%) — закрываем позиции (%d)",
-                     row["day"], ev.gain, ev.pct, cfg.target_profit_pct, len(positions))
-            self._close_one_chunk(positions, books)
+            if time.monotonic() - self._goal_log_at >= 5:      # раз в 5 с, а не каждую секунду
+                self._goal_log_at = time.monotonic()
+                log.info("%s | цель дня выполнена (результат %+.4f = %.3f%% >= %.2f%%) — закрываем позиции (%d)",
+                         row["day"], ev.gain, ev.pct, cfg.target_profit_pct, len(positions))
+            self._close_all(positions, books)
             return ev
         self.closing = False
         if self._pending_final:
@@ -194,18 +234,21 @@ class Bot:
                     txt, self.cfg.target_profit_pct, equity)
         self._pending_final = False
 
-    def _close_one_chunk(self, positions: list[PositionView], books: dict[str, dict]) -> None:
-        ordered = sorted(positions, key=lambda p: p.key)
-        p = ordered[self._rr % len(ordered)]
-        self._rr += 1
+    def _close_all(self, positions: list[PositionView], books: dict[str, dict]) -> None:
+        """Закрываем ВСЕ позиции сразу и параллельно; первыми — те, у кого прибыль за последние 1–2 мин выросла сильнее
+        всего (импульс может откатиться, их выходим первыми)."""
+        now = time.monotonic()
+        scored = sorted(((self._momentum(p, now), p) for p in positions), key=lambda t: -t[0])
+        if len(scored) > 1:
+            order = [p.symbol for _, p in scored[:6]]
+            if order != self._last_priority or now - self._priority_at > 10:   # не повторяем строку каждую секунду
+                self._last_priority, self._priority_at = order, now
+                log.info("Приоритет закрытия (рост прибыли за 1–2 мин): %s",
+                         ", ".join(f"{p.symbol} {m:+.2f}" for m, p in scored[:6]))
         try:
-            filled = self.closer.close_chunk(p, books[p.symbol])
-            # Хедж: закрываем ту же долю противоположной ноги, чтобы не остаться с перекошенной позицией.
-            opp = next((q for q in positions if q.symbol == p.symbol and q.key != p.key), None)
-            if opp is not None and filled > 0 and p.size > 0:
-                self.closer.close_chunk(opp, books[opp.symbol], fraction=min(filled / p.size, 1.0))
+            self.closer.close_all([p for _, p in scored], books)
         except Exception:  # одна неудачная лимитка не должна ронять бота
-            log.exception("Ошибка при закрытии %s", p.symbol)
+            log.exception("Ошибка при закрытии позиций")
 
     # ---------- цикл ----------
     def run(self, copier=None) -> None:

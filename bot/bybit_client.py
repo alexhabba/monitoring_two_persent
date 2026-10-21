@@ -15,6 +15,7 @@ TESTNET = "https://api-testnet.bybit.com"
 
 # Ошибки, при которых отмену/повторную отмену можно спокойно игнорировать
 ORDER_GONE_CODES = {110001, 170213, 170142}
+RATE_LIMIT_CODE = 10006   # Too many visits
 # Плечо уже такое, какое просили
 LEVERAGE_NOT_MODIFIED = 110043
 
@@ -89,6 +90,9 @@ class BybitClient:
         js = resp.json()
         if js.get("retCode") == 10002 and auth and _retry:  # часы разошлись — пересинхронизируем
             self.sync_time()
+            return self._request(method, path, params, body, auth, _retry=False)
+        if js.get("retCode") == RATE_LIMIT_CODE and auth and _retry:   # лимит запросов — короткая пауза и один повтор
+            time.sleep(0.6)
             return self._request(method, path, params, body, auth, _retry=False)
         if js.get("retCode") != 0:
             raise BybitError(js.get("retCode", -1), js.get("retMsg", ""), path)
@@ -201,6 +205,23 @@ class BybitClient:
     def get_margin_mode(self) -> str:
         """REGULAR_MARGIN (кросс) | ISOLATED_MARGIN | PORTFOLIO_MARGIN."""
         return self._request("GET", "/v5/account/info").get("marginMode", "")
+
+    def get_open_orders(self, category: str, settle_coin: str) -> list[dict]:
+        """Все активные ордера по аккаунту (одним запросом, все страницы)."""
+        out: list[dict] = []
+        cursor = None
+        while True:
+            res = self._request("GET", "/v5/order/realtime", {
+                "category": category, "settleCoin": settle_coin, "openOnly": 0, "limit": 50, "cursor": cursor})
+            out.extend(res.get("list", []))
+            cursor = res.get("nextPageCursor")
+            if not cursor:
+                return out
+
+    def amend_order(self, category: str, symbol: str, order_id: str, price: str, qty: str) -> None:
+        """Изменить цену/объём живого ордера (одним запросом, без потери ордера при ошибке)."""
+        self._request("POST", "/v5/order/amend", body={
+            "category": category, "symbol": symbol, "orderId": order_id, "price": price, "qty": qty})
 
     def cancel_order(self, category: str, symbol: str, order_id: str) -> None:
         try:
