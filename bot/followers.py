@@ -24,6 +24,7 @@ from decimal import Decimal
 
 from .bybit_client import BybitClient, BybitError
 from .closer import ChunkPlan, FINAL, _fmt, _floor_to_step, book_depth, fmt_price
+from . import logctx
 from .config import Config
 from .monitor import Bot
 from .pnl import Key, PositionView, best_prices, parse_position
@@ -31,7 +32,6 @@ from .state import StateStore
 
 log = logging.getLogger("copy")
 
-_ctx = threading.local()
 RATIO_HYSTERESIS = 0.02       # пропорцию меняем, только если она ушла больше чем на 2%
 RATE_LIMIT_CODE = 10006       # Bybit: Too many visits
 RATE_LIMIT_PAUSE_SEC = 3.0
@@ -41,7 +41,7 @@ class AccountFilter(logging.Filter):
     """Дописывает [имя копии] к сообщениям, которые пишутся из потока этой копии."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        name = getattr(_ctx, "name", None)
+        name = getattr(logctx.ctx, "name", None)
         if name and not getattr(record, "_acct", False):
             record.msg = f"[{name}] {record.msg}"
             record._acct = True
@@ -186,18 +186,21 @@ class Follower:
         self._seq = 0
         self._margin_checked = False
         self._pause_until = 0.0
+        self._detached_logged = False
+        self.bot.closer.account = self.name      # метка счёта для строк лога из потоков закрытия
         self.future: Future | None = None
 
     def busy(self) -> bool:
         return self.future is not None and not self.future.done()
 
     # ---------- вход ----------
-    def tick(self, main_positions: list[PositionView], main_equity: float, main_margin: str) -> None:
+    def tick(self, main_positions: list[PositionView], main_equity: float, main_margin: str,
+             main_goal_today: bool = False) -> None:
         if time.monotonic() < self._pause_until:
             return
-        _ctx.name = self.name
+        logctx.set_account(self.name)
         try:
-            self._tick(main_positions, main_equity, main_margin)
+            self._tick(main_positions, main_equity, main_margin, main_goal_today)
         except BybitError as e:
             if e.code == RATE_LIMIT_CODE:
                 self._pause_until = time.monotonic() + RATE_LIMIT_PAUSE_SEC
@@ -207,9 +210,10 @@ class Follower:
         except Exception:
             log.exception("Ошибка шага копирования")
         finally:
-            _ctx.name = None
+            logctx.set_account(None)
 
-    def _tick(self, main_positions: list[PositionView], main_equity: float, main_margin: str) -> None:
+    def _tick(self, main_positions: list[PositionView], main_equity: float, main_margin: str,
+              main_goal_today: bool = False) -> None:
         cfg, bot = self.cfg, self.bot
         mono = time.monotonic()
         row = self.store.get_day(bot.clock().date().isoformat())
@@ -234,6 +238,16 @@ class Follower:
             if main_margin and mode != main_margin:
                 log.warning("Режим маржи копии (%s) отличается от основного (%s) — переключите вручную в Bybit "
                             "(это настройка всего аккаунта)", mode, main_margin)
+        if main_goal_today:
+            # Основной достиг цели и закрывается сам. Его сокращения копия НЕ повторяет (иначе она выкупала бы позиции
+            # по невыгодной цене, хотя её собственная цель не достигнута): до 00:00 копия закрывается только по своей цели.
+            self._cancel_all()
+            if not self._detached_logged:
+                self._detached_logged = True
+                log.warning("Основной счёт достиг цели дня — копия отсоединена до 00:00: ничего не копирует, "
+                            "закрывается только по своей цели")
+            return
+        self._detached_logged = False
         self._sync(main_positions, main_equity)
 
     # ---------- синхронизация ----------
@@ -365,7 +379,7 @@ class Copier:
                     " [DRY-RUN]" if cfg.dry_run else "")
         return cls(main_client, cfg, followers)
 
-    def tick(self) -> None:
+    def tick(self, main_goal_today: bool = False) -> None:
         try:
             raw = [parse_position(r) for r in self.main.get_positions(self.cfg.category, self.cfg.settle_coin)]
             if time.monotonic() - self._equity_at >= self.cfg.copy_ratio_refresh_sec or self._equity <= 0:
@@ -386,7 +400,7 @@ class Copier:
         self._positions = raw
         for f in self.followers:
             if not f.busy():
-                f.future = self.pool.submit(f.tick, raw, self._equity, self._margin)
+                f.future = self.pool.submit(f.tick, raw, self._equity, self._margin, main_goal_today)
 
     def close(self) -> None:
         self.pool.shutdown(wait=True)

@@ -267,7 +267,7 @@ class Bot:
             while True:   # между шагами основного счёта копии сверяются каждую секунду
                 if copier is not None:
                     try:
-                        copier.tick()
+                        copier.tick(self.store.has_goal_event(self.clock().date().isoformat()))
                     except Exception:
                         log.exception("Ошибка копирования")
                 remaining = end - time.monotonic()
