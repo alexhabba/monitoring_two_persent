@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal
 from typing import Callable
 
+from . import logctx
 from .bybit_client import BybitClient, BybitError, ORDER_GONE_CODES
 from .config import Config
 from .pnl import Key, PositionView, best_prices
@@ -120,6 +121,7 @@ class PositionCloser:
         self.resting: dict[Key, Resting] = {}
         self._err_at: dict[str, float] = {}
         self._dry_logged: dict[Key, str] = {}
+        self.account: str | None = None      # имя копирующего счёта — для меток в логе
 
     def instrument(self, symbol: str) -> dict:
         if symbol not in self._instruments:
@@ -185,7 +187,8 @@ class PositionCloser:
             for p in positions:
                 self._safe_work(p, books[p.symbol], fractions.get(p.key))
             return
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="close") as ex:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="close",
+                                initializer=logctx.set_account, initargs=(self.account,)) as ex:
             futs = [ex.submit(self._safe_work, p, books[p.symbol], fractions.get(p.key)) for p in positions]
             for f in futs:
                 f.result()

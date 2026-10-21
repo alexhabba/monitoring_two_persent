@@ -69,6 +69,7 @@ class StateStore:
         """Сбросить день (строка дня удаляется, при следующем шаге база пересчитается)."""
         with self.conn:
             n = self.conn.execute("DELETE FROM days WHERE day=?", (day,)).rowcount
+            self.conn.execute("DELETE FROM events WHERE day=? AND kind='goal'", (day,))   # день «с нуля» — цели тоже нет
             self.conn.execute("INSERT INTO events(ts,day,kind,text) VALUES(datetime('now'),?,?,?)",
                               (day, "reset", "день сброшен вручную"))
         return n > 0
@@ -90,6 +91,10 @@ class StateStore:
         with self.conn:
             self.conn.execute("UPDATE days SET final_equity=?, final_gain=?, final_ts=? WHERE day=?",
                               (equity, gain, ts, day))
+
+    def has_goal_event(self, day: str) -> bool:
+        """Достигал ли бот цели в этот день (хоть раз) — копии после этого отсоединяются от основного до конца дня."""
+        return self.conn.execute("SELECT 1 FROM events WHERE day=? AND kind='goal' LIMIT 1", (day,)).fetchone() is not None
 
     def add_event(self, day: str, ts: str, kind: str, text: str) -> None:
         with self.conn:

@@ -973,3 +973,47 @@ def test_not_whitelisted_symbol_is_reported_clearly_and_does_not_crash(tmp_path,
         closer.close_all([p], {"C0USDT": make_book(100.0)})    # вторая попытка: тот же текст в лог не повторяется
     msgs = [r.getMessage() for r in caplog.records if "не удалось закрывать" in r.getMessage()]
     assert len(msgs) == 1 and "whitelist" in msgs[0] and not closer.resting
+
+
+# ---------- копия отсоединяется после цели основного ----------
+def test_follower_does_not_mirror_main_reductions_after_main_goal(tmp_path):
+    cl = CopyFake(equity=1000.0, size=100.0)                 # на копии 100, основной уже сократился до 4 (нужно 40)
+    f = make_follower(tmp_path, cl)
+    main = [PositionView("BTCUSDT", "Buy", 4.0, 100.0, 100.0, 0.0, 0, 1.0, leverage=5.0)]
+    f._tick(main, 100.0, "REGULAR_MARGIN", main_goal_today=True)
+    assert cl.placed == []                                    # сокращения основного не повторяем
+    f._tick(main, 100.0, "REGULAR_MARGIN", main_goal_today=False)    # без признака цели обычное зеркалирование
+    assert cl.placed and cl.placed[0][0] == "Sell" and cl.placed[0][3] is True
+
+
+def test_goal_event_survives_unlatch_and_is_cleared_by_day_reset(tmp_path):
+    cl = FakeClient()
+    bot, store, clock = make_bot(cl, tmp_path)
+    bot.step()
+    assert not store.has_goal_event("2026-10-19")
+    cl.mark = 104.0
+    bot.step()                                                # цель достигнута
+    assert store.has_goal_event("2026-10-19")
+    cl.mark = 100.5
+    bot.step()                                                # цель снята, но «сегодня цель была» остаётся
+    assert store.get_day("2026-10-19")["goal_reached"] == 0 and store.has_goal_event("2026-10-19")
+    store.delete_day("2026-10-19")                            # сброс дня — день «с нуля»
+    assert not store.has_goal_event("2026-10-19")
+
+
+def test_account_label_reaches_closing_worker_threads(tmp_path):
+    from bot import logctx
+    seen = []
+    cl = RestingFake(legs={0: ["Buy", 3.0, 100.0], 1: ["Buy", 3.0, 100.0]})
+    orig = cl.place_limit_close
+
+    def spy(*a, **k):
+        seen.append(getattr(logctx.ctx, "name", None))
+        return orig(*a, **k)
+    cl.place_limit_close = spy
+    closer = PositionCloser(cl, cfg(close_workers=2), sleep=lambda s: None)
+    closer.account = "acc2"
+    ps = [PositionView("C0USDT", "Buy", 3.0, 100.0, 100.0, 0.0, 0, 10.0),
+          PositionView("C1USDT", "Buy", 3.0, 100.0, 100.0, 0.0, 1, 10.0)]
+    closer.close_all(ps, {"C0USDT": make_book(100.0), "C1USDT": make_book(100.0)})
+    assert seen == ["acc2", "acc2"]
