@@ -94,6 +94,18 @@ class Bot:
         self._pending_final = False
         return self.store.get_day(day)
 
+    def _evaluate(self, day: dict, now: datetime, positions: list[PositionView],
+                  equity: float) -> tuple[Evaluation, dict[str, dict]]:
+        """Результат дня «как если бы всё закрыли сейчас». Ошибка лога транзакций — исключение, т.е. без решения."""
+        books = {s: self.client.get_orderbook(self.cfg.category, s, self.cfg.book_limit)
+                 for s in {p.symbol for p in positions}}
+        fees = {s: self._taker_fee(s) for s in books}
+        start_ms = int(datetime.fromisoformat(day["start_ts"]).timestamp() * 1000)
+        realized = self.tracker.realized(day["day"], start_ms, self._now_ms(now))
+        ev = evaluate(day["start_equity"], day["start_unrealised"], realized,
+                      positions, books, fees, self.cfg.slippage_buffer_bps, equity)
+        return ev, books
+
     # ---------- один шаг ----------
     def step(self) -> Evaluation:
         cfg = self.cfg
@@ -106,14 +118,7 @@ class Bot:
         positions = [parse_position(r) for r in self.client.get_positions(cfg.category, cfg.settle_coin)]
         day = self._ensure_day(now, equity, sum(p.unrealised_pnl for p in positions))
 
-        books = {s: self.client.get_orderbook(cfg.category, s, cfg.book_limit)
-                 for s in {p.symbol for p in positions}}
-        fees = {s: self._taker_fee(s) for s in books}
-
-        start_ms = int(datetime.fromisoformat(day["start_ts"]).timestamp() * 1000)
-        realized = self.tracker.realized(day["day"], start_ms, self._now_ms(now))  # при ошибке — без решения
-        ev = evaluate(day["start_equity"], day["start_unrealised"], realized,
-                      positions, books, fees, cfg.slippage_buffer_bps, equity)
+        ev, books = self._evaluate(day, now, positions, equity)
 
         goal = ev.pct >= cfg.target_profit_pct
         if goal:
@@ -138,24 +143,39 @@ class Bot:
         return ev
 
     def _goal_step(self, row: dict, now: datetime) -> Evaluation:
-        """Цель дня уже выполнена: только позиции и закрытие. Ни лога транзакций, ни баланса."""
+        """Цель дня уже отмечена. Перед КАЖДЫМ куском закрытия результат дня пересчитывается заново: если он
+        опустился ниже цели — закрытие останавливается, отметка о цели снимается и бот снова следит за результатом.
+        Если позиций нет — раз в шаг тоже проверяем, что результат (уже реализованный) не ниже цели."""
         cfg = self.cfg
         positions = [parse_position(r) for r in self.client.get_positions(cfg.category, cfg.settle_coin)]
-        ev = Evaluation(start_equity=row["start_equity"], gain=row["goal_gain"] or 0.0,
-                        pct=row["goal_pct"] or 0.0, goal=True)
+        equity = self.client.get_equity(cfg.account_type)
+        ev, books = self._evaluate(row, now, positions, equity)
+        if ev.pct < cfg.target_profit_pct:
+            self.store.clear_goal(row["day"])
+            self.store.add_event(row["day"], now.isoformat(), "goal_lost",
+                                 f"результат дня {ev.gain:+.4f} USDT = {ev.pct:.3f}% < цели {cfg.target_profit_pct:.2f}% "
+                                 f"— закрытие остановлено, цель снята")
+            log.warning("%s | результат дня %+.4f USDT = %.3f%% опустился ниже цели %.2f%% — ЗАКРЫТИЕ ОСТАНОВЛЕНО, "
+                        "цель снята, продолжаем следить (позиций %d)",
+                        row["day"], ev.gain, ev.pct, cfg.target_profit_pct, len(positions))
+            self.closing = False
+            self._pending_final = False
+            ev.goal = False
+            return ev
+        ev.goal = True
         if positions:
-            books = {s: self.client.get_orderbook(cfg.category, s, cfg.book_limit)
-                     for s in {p.symbol for p in positions}}
             self.closing = True
             self._pending_final = True
-            log.info("%s | цель дня выполнена — закрываем позиции (%d)", row["day"], len(positions))
+            log.info("%s | цель дня выполнена (результат %+.4f = %.3f%% >= %.2f%%) — закрываем позиции (%d)",
+                     row["day"], ev.gain, ev.pct, cfg.target_profit_pct, len(positions))
             self._close_one_chunk(positions, books)
             return ev
         self.closing = False
         if self._pending_final:
             self._record_final(row, now)
         else:
-            log.info("%s | цель дня выполнена, позиций нет — ждём до 00:00", row["day"])
+            log.info("%s | цель дня выполнена (%+.4f = %.3f%%), позиций нет — ждём до 00:00",
+                     row["day"], ev.gain, ev.pct)
         return ev
 
     def _record_final(self, row: dict, now: datetime) -> None:

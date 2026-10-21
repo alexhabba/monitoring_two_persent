@@ -32,6 +32,9 @@ from .state import StateStore
 log = logging.getLogger("copy")
 
 _ctx = threading.local()
+RATIO_HYSTERESIS = 0.02       # пропорцию меняем, только если она ушла больше чем на 2%
+RATE_LIMIT_CODE = 10006       # Bybit: Too many visits
+RATE_LIMIT_PAUSE_SEC = 3.0
 
 
 class AccountFilter(logging.Filter):
@@ -182,6 +185,7 @@ class Follower:
         self._logged: dict[Key, str] = {}
         self._seq = 0
         self._margin_checked = False
+        self._pause_until = 0.0
         self.future: Future | None = None
 
     def busy(self) -> bool:
@@ -189,9 +193,17 @@ class Follower:
 
     # ---------- вход ----------
     def tick(self, main_positions: list[PositionView], main_equity: float, main_margin: str) -> None:
+        if time.monotonic() < self._pause_until:
+            return
         _ctx.name = self.name
         try:
             self._tick(main_positions, main_equity, main_margin)
+        except BybitError as e:
+            if e.code == RATE_LIMIT_CODE:
+                self._pause_until = time.monotonic() + RATE_LIMIT_PAUSE_SEC
+                log.warning("Лимит запросов Bybit — пауза %.0f с", RATE_LIMIT_PAUSE_SEC)
+            else:
+                log.warning("Ошибка Bybit в шаге копирования: %s", e)
         except Exception:
             log.exception("Ошибка шага копирования")
         finally:
@@ -230,18 +242,23 @@ class Follower:
             self._instr[symbol] = {**self.client.get_instrument(self.cfg.category, symbol), "symbol": symbol}
         return self._instr[symbol]
 
-    def _refresh_ratio(self, main_equity: float) -> None:
+    def _refresh_ratio(self, main_balance: float) -> None:
+        """Пропорция = баланс копии / баланс основного × множитель. Баланс БЕЗ нереализованного PnL: equity прыгает
+        вместе с ценой и у двух счетов по-разному, из-за чего пропорция «плыла» и копия то докупала, то сбрасывала.
+        Дополнительно гистерезис: меньше ±2% от текущей пропорции — не обновляем."""
         if self.ratio > 0 and time.monotonic() - self._ratio_at < self.cfg.copy_ratio_refresh_sec:
             return
-        equity = self.client.get_equity(self.cfg.account_type)
-        if main_equity <= 0 or equity <= 0:
-            log.warning("Нельзя посчитать пропорцию: equity основного %.4f, копии %.4f", main_equity, equity)
+        balance = self.client.get_wallet_balance(self.cfg.account_type)
+        if main_balance <= 0 or balance <= 0:
+            log.warning("Нельзя посчитать пропорцию: баланс основного %.4f, копии %.4f", main_balance, balance)
             return
-        new = equity / main_equity * self.spec.multiplier
-        if self.ratio <= 0 or abs(new / self.ratio - 1) > 0.01:
-            log.info("Пропорция: ×%.4f (equity копии %.2f / основного %.2f × множитель %.2f)",
-                     new, equity, main_equity, self.spec.multiplier)
-        self.ratio, self._ratio_at = new, time.monotonic()
+        new = balance / main_balance * self.spec.multiplier
+        self._ratio_at = time.monotonic()
+        if self.ratio > 0 and abs(new / self.ratio - 1) <= RATIO_HYSTERESIS:
+            return
+        log.info("Пропорция: ×%.4f (баланс копии %.2f / основного %.2f × множитель %.2f, без нереализованного PnL)",
+                 new, balance, main_balance, self.spec.multiplier)
+        self.ratio = new
 
     def _sync(self, main_positions: list[PositionView], main_equity: float) -> None:
         cfg = self.cfg
@@ -352,12 +369,12 @@ class Copier:
         try:
             raw = [parse_position(r) for r in self.main.get_positions(self.cfg.category, self.cfg.settle_coin)]
             if time.monotonic() - self._equity_at >= self.cfg.copy_ratio_refresh_sec or self._equity <= 0:
-                self._equity = self.main.get_equity(self.cfg.account_type)
+                self._equity = self.main.get_wallet_balance(self.cfg.account_type)
                 self._equity_at = time.monotonic()
                 if not self._margin:
                     self._margin = self.main.get_margin_mode()
-        except Exception:
-            log.exception("Не удалось получить позиции основного счёта — копии ничего не делают")
+        except Exception as e:
+            log.warning("Не удалось получить позиции основного счёта (%s) — копии ничего не делают", e)
             return
         # Пустой ответ после непустого принимаем только со второго раза: сбой API не должен закрыть все копии
         if not raw and self._positions:

@@ -212,7 +212,7 @@ def test_goal_latched_then_everything_closed_and_final_recorded(tmp_path):
     assert row["final_equity"] is not None
 
 
-def test_new_positions_after_goal_are_closed_even_at_a_loss(tmp_path):
+def test_new_position_after_goal_is_closed_while_result_stays_above_target(tmp_path):
     cl = FakeClient()
     bot, store, clock = make_bot(cl, tmp_path)
     bot.step()
@@ -220,10 +220,42 @@ def test_new_positions_after_goal_are_closed_even_at_a_loss(tmp_path):
     for _ in range(12):
         bot.step()
     n_before = len(cl.orders)
-    cl.legs[5] = ["Buy", 2.0, 110.0]          # новая позиция, уже в минусе
+    cl.legs[5] = ["Buy", 2.0, 103.0]          # новая позиция около рынка: результат дня остаётся выше цели
     for _ in range(8):
         bot.step()
     assert len(cl.orders) > n_before and cl.legs[5][1] <= 1e-9
+
+
+def test_new_losing_position_after_goal_is_not_closed_and_goal_is_cleared(tmp_path):
+    cl = FakeClient()
+    bot, store, clock = make_bot(cl, tmp_path)
+    bot.step()
+    cl.mark = 104.0
+    for _ in range(12):
+        bot.step()
+    n_before = len(cl.orders)
+    cl.legs[5] = ["Buy", 20.0, 110.0]         # большой минус: результат дня падает ниже цели
+    bot.step()
+    assert len(cl.orders) == n_before and cl.legs[5][1] == 20.0
+    assert store.get_day("2026-10-19")["goal_reached"] == 0 and not bot.closing
+
+
+def test_closing_stops_when_result_falls_below_target_and_resumes_when_back(tmp_path):
+    cl = FakeClient()
+    bot, store, clock = make_bot(cl, tmp_path)
+    bot.step()                       # база 500
+    cl.mark = 104.0                  # +12 = 2.4% -> цель, первый кусок закрытия
+    bot.step()
+    assert store.get_day("2026-10-19")["goal_reached"] == 1 and len(cl.orders) == 1
+    cl.mark = 100.5                  # результат упал ниже 2%: перед следующим куском проверка не проходит
+    for _ in range(3):
+        bot.step()
+    assert len(cl.orders) == 1                          # ни одного нового ордера
+    row = store.get_day("2026-10-19")
+    assert row["goal_reached"] == 0 and row["goal_ts"] is None and not bot.closing
+    cl.mark = 104.0                  # снова выше цели — цель ставится заново, закрытие продолжается
+    bot.step()
+    assert store.get_day("2026-10-19")["goal_reached"] == 1 and len(cl.orders) == 2
 
 
 def test_goal_already_earned_without_positions_blocks_new_ones(tmp_path):
@@ -432,32 +464,35 @@ def test_first_run_midday_open_positions_closed_after_goal_found(tmp_path):
     assert cl.orders and cl.legs[0][1] <= 1e-9
 
 
-def test_after_goal_no_transaction_log_or_equity_requests(tmp_path):
+def test_after_goal_without_positions_result_is_rechecked_and_goal_cleared_when_it_drops(tmp_path):
     cl = FakeClient(legs={0: ["Buy", 0.0, 100.0]})
     bot, store, clock = make_bot(cl, tmp_path)
+    bot.step()                                               # база 500
     cl.add_realized(15.0, ts_ms=_ms(3))
-    bot.step()                                               # цель найдена и записана
+    bot.step()
+    assert store.get_day("2026-10-19")["goal_reached"] == 1
     calls = cl.tx_calls
-    eq_calls = {"n": 0}
-    orig = cl.get_equity
-    cl.get_equity = lambda t: (eq_calls.__setitem__("n", eq_calls["n"] + 1), orig(t))[1]
-    for _ in range(5):
-        clock.advance(seconds=10)
-        bot.step()
-    assert cl.tx_calls == calls and eq_calls["n"] == 0
+    clock.advance(seconds=10)
+    bot.step()
+    assert cl.tx_calls > calls                               # результат пересчитывается, цель остаётся
+    assert store.get_day("2026-10-19")["goal_reached"] == 1
+    cl.add_realized(-10.0, ts_ms=_ms(3))                     # потом результат упал (комиссии/убыток)
+    clock.advance(seconds=10)
+    bot.step()
+    assert store.get_day("2026-10-19")["goal_reached"] == 0
 
 
-def test_after_goal_restart_does_not_query_log_either(tmp_path):
+def test_after_goal_restart_keeps_goal_if_result_still_above_target(tmp_path):
     cl = FakeClient(legs={0: ["Buy", 0.0, 100.0]})
     bot, store, clock = make_bot(cl, tmp_path)
+    bot.step()
     cl.add_realized(15.0, ts_ms=_ms(3))
     bot.step()
     store.close()
     store2 = StateStore(str(tmp_path / "state.db"))
     bot2, _, _ = make_bot(cl, tmp_path, clock=clock, store=store2)
-    calls = cl.tx_calls
     bot2.step()
-    assert cl.tx_calls == calls
+    assert store2.get_day("2026-10-19")["goal_reached"] == 1
 
 
 def test_funding_and_fees_are_in_realized_and_foreign_types_excluded(tmp_path):
@@ -489,15 +524,19 @@ def test_full_refresh_picks_up_late_entry(tmp_path):
     assert abs(bot.step().realized - 3.0) < 1e-9
 
 
-def test_goal_closing_continues_if_transaction_log_fails(tmp_path):
+def test_goal_closing_pauses_if_transaction_log_fails(tmp_path):
     cl, bot, store, clock = _base_bot(tmp_path)
     cl.mark = 104.0
     bot.step()                      # цель достигнута, пошло закрытие
     n = len(cl.orders)
     cl.get_transaction_log = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("api down"))
     clock.advance(seconds=10)
-    bot.step()
-    assert len(cl.orders) > n       # закрытие не зависит от лога
+    try:
+        bot.step()
+        assert False, "должно выбросить"
+    except RuntimeError:
+        pass
+    assert len(cl.orders) == n      # без данных о результате новый кусок не ставим
 
 
 def test_no_decision_without_transaction_log_before_goal(tmp_path):
@@ -637,6 +676,9 @@ class CopyFake:
         self.orders = {}
 
     def get_equity(self, t):
+        return self.equity
+
+    def get_wallet_balance(self, t):
         return self.equity
 
     def get_positions(self, category, settle):
@@ -780,6 +822,7 @@ def test_webui_auth_csrf_and_save(tmp_path):
 
 class MarginFake(FakeClient):
     def get_margin_mode(self): return "REGULAR_MARGIN"
+    def get_wallet_balance(self, t): return self.get_equity(t)
 
 
 def test_copier_tick_runs_followers_in_worker_threads_without_errors(tmp_path, caplog):
@@ -793,3 +836,33 @@ def test_copier_tick_runs_followers_in_worker_threads_without_errors(tmp_path, c
     cp.close()
     assert not [r for r in caplog.records if "Ошибка" in r.getMessage()], caplog.text
     assert f.store.conn is not None
+
+
+def test_ratio_ignores_floating_pnl_and_small_drift(tmp_path):
+    """Прежняя причина «качелей»: equity (с нереализованным PnL) двигал пропорцию, и копия то докупала, то сбрасывала."""
+    cl = CopyFake(equity=1000.0)
+    f = make_follower(tmp_path, cl)
+    f._refresh_ratio(100.0)
+    assert f.ratio == 10.0
+    cl.equity = 1015.0                 # дрейф +1.5%: внутри гистерезиса 2% — пропорция не меняется
+    f._ratio_at = -1e9
+    f._refresh_ratio(100.0)
+    assert f.ratio == 10.0
+    cl.equity = 1100.0                 # реальное изменение баланса (пополнение) — пропорция обновляется
+    f._ratio_at = -1e9
+    f._refresh_ratio(100.0)
+    assert f.ratio == 11.0
+
+
+def test_rate_limit_pauses_follower(tmp_path):
+    from bot.bybit_client import BybitError
+    cl = CopyFake(equity=1000.0)
+    f = make_follower(tmp_path, cl)
+
+    def boom(*a, **k):
+        raise BybitError(10006, "Too many visits", "/x")
+    f._sync = boom
+    f.tick([], 100.0, "REGULAR_MARGIN")
+    assert f._pause_until > 0
+    f._sync = lambda *a, **k: (_ for _ in ()).throw(AssertionError("не должен вызываться во время паузы"))
+    f.tick([], 100.0, "REGULAR_MARGIN")      # во время паузы шаг пропускается

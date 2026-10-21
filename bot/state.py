@@ -79,6 +79,13 @@ class StateStore:
                 "UPDATE days SET goal_reached=1, goal_ts=?, goal_equity=?, goal_gain=?, goal_pct=? WHERE day=?",
                 (ts, equity, gain, pct, day))
 
+    def clear_goal(self, day: str) -> None:
+        """Снять отметку «цель выполнена» (результат дня упал ниже цели до того, как всё закрыто)."""
+        with self.conn:
+            self.conn.execute(
+                "UPDATE days SET goal_reached=0, goal_ts=NULL, goal_equity=NULL, goal_gain=NULL, goal_pct=NULL, "
+                "final_equity=NULL, final_gain=NULL, final_ts=NULL WHERE day=?", (day,))
+
     def set_final(self, day: str, ts: str, equity: float, gain: float | None) -> None:
         with self.conn:
             self.conn.execute("UPDATE days SET final_equity=?, final_gain=?, final_ts=? WHERE day=?",

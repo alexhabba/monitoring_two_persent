@@ -113,6 +113,11 @@ class BybitClient:
         acc = res["list"][0]
         return float(acc.get("totalEquity") or 0)
 
+    def get_wallet_balance(self, account_type: str) -> float:
+        """Баланс счёта БЕЗ нереализованного PnL (equity − UPL). Он не прыгает вместе с ценой, в отличие от equity."""
+        acc = self._request("GET", "/v5/account/wallet-balance", {"accountType": account_type})["list"][0]
+        return float(acc.get("totalEquity") or 0) - float(acc.get("totalPerpUPL") or 0)
+
     def get_transaction_log(self, account_type: str, category: str | None, currency: str,
                             start_ms: int, end_ms: int) -> list[dict]:
         """Записи лога транзакций UTA за интервал (≤7 дней), все страницы."""
