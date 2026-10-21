@@ -973,3 +973,21 @@ def test_not_whitelisted_symbol_is_reported_clearly_and_does_not_crash(tmp_path,
         closer.close_all([p], {"C0USDT": make_book(100.0)})    # вторая попытка: тот же текст в лог не повторяется
     msgs = [r.getMessage() for r in caplog.records if "не удалось закрывать" in r.getMessage()]
     assert len(msgs) == 1 and "whitelist" in msgs[0] and not closer.resting
+
+
+def test_base_from_now_ignores_profit_earned_before_start(tmp_path):
+    def run(flag):
+        cl = FakeClient(legs={0: ["Buy", 0.0, 100.0]})
+        bot, store, clock = make_bot(cl, tmp_path / ("a" if flag else "b"), base_from_now=flag, target_profit_pct=0.13)
+        (tmp_path / ("a" if flag else "b")).mkdir(exist_ok=True)
+        cl.add_realized(20.0, ts_ms=_ms(3))          # прибыль, заработанная сегодня ДО старта бота
+        ev = bot.step()
+        return cl, bot, store, ev
+    cl, bot, store, ev = run(True)
+    row = store.get_day("2026-10-19")
+    assert abs(row["start_equity"] - cl.get_equity("")) < 1e-9 and row["goal_reached"] == 0 and abs(ev.pct) < 1e-9
+    cl.add_realized(1.0)                             # +1 USDT от базы ~520 = 0.19% >= 0.13%
+    bot.step()
+    assert store.get_day("2026-10-19")["goal_reached"] == 1
+    cl2, bot2, store2, ev2 = run(False)              # без флага ранняя прибыль восстанавливается и цель сразу достигнута
+    assert store2.get_day("2026-10-19")["goal_reached"] == 1

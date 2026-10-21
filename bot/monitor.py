@@ -60,7 +60,7 @@ class Bot:
             kind = "late_start"  # бот был выключен в полночь
 
         start_ts, start_equity, note = now.isoformat(), equity, ""
-        if kind != "midnight":
+        if kind != "midnight" and not self.cfg.base_from_now:
             # Бот стартовал днём: восстанавливаем базу на 00:00 по логу транзакций, чтобы учесть уже сделанное за день.
             midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
             try:
@@ -89,6 +89,8 @@ class Bot:
             except Exception:
                 log.exception("Не удалось восстановить базу на 00:00 — берём текущий баланс")
 
+        if self.cfg.base_from_now and kind != "midnight":
+            note = "; BASE_FROM_NOW: база = состояние на момент старта, сделки/прибыль до этого момента не учитываются"
         self.store.create_day(day, start_equity, unrealised, start_ts, kind, self.cfg.target_profit_pct)
         self.store.add_event(day, now.isoformat(), "day_start",
                              f"{kind}: база дня {start_equity:.4f}, нереализованный {unrealised:.4f}{note}")

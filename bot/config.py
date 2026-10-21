@@ -58,6 +58,7 @@ class Config:
     followers_file: str = ""            # JSON со списком счетов; пусто = {data_dir}/followers.json
     copy_tick_sec: float = 1.0
     copy_ratio_refresh_sec: float = 60.0
+    base_from_now: bool = False          # тест: база дня = состояние на момент старта, сегодняшняя прибыль не учитывается
     copy_deadband_pct: float = 3.0       # не дёргаем позицию из-за расхождения меньше N% от нужного размера
     ui_password: str = ""               # пусто = веб-интерфейс настроек выключен
     ui_host: str = "127.0.0.1"
@@ -102,6 +103,7 @@ class Config:
             followers_file=_str("FOLLOWERS_FILE", ""),
             copy_tick_sec=_float("COPY_TICK_SEC", 1.0),
             copy_ratio_refresh_sec=_float("COPY_RATIO_REFRESH_SEC", 60.0),
+            base_from_now=_bool("BASE_FROM_NOW", False),
             copy_deadband_pct=_float("COPY_DEADBAND_PCT", 3.0),
             ui_password=_str("UI_PASSWORD", ""),
             ui_host=_str("UI_HOST", "127.0.0.1"),
