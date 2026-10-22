@@ -24,6 +24,13 @@ def _float(name: str, default: float) -> float:
     return float(raw)
 
 
+def _floats(name: str, default: tuple) -> tuple:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return tuple(float(x) for x in raw.replace(";", ",").split(",") if x.strip())
+
+
 def _str(name: str, default: str) -> str:
     raw = os.getenv(name)
     return default if raw is None or raw.strip() == "" else raw.strip()
@@ -52,6 +59,17 @@ class Config:
     max_spread_bps: float = 20.0
     order_timeout_sec: float = 15.0
     book_limit: int = 50
+    # --- WebSocket и лесенка тейк-профитов ---
+    use_websocket: bool = False          # стакан/позиции/исполнения по WebSocket (при сбое — обычные запросы REST)
+    stream_max_age_sec: float = 3.0      # данные старше — считаем устаревшими и идём в REST
+    fast_tick_sec: float = 0.25          # частота быстрой проверки (цель по живым данным, лесенка)
+    tp_ladder: bool = False              # заранее выставленные тейк-профиты на цену, где счёт достигнет цели
+    tp_coefs: tuple = (1.0, 1.3)         # уровни лесенки: во сколько раз дальше от цены, нужной для цели
+    tp_book_fraction: float = 0.2        # не больше этой доли видимой заявки стакана на одном уровне
+    tp_density_window_bps: float = 20.0  # окно (б.п.) от уровня, где ищем плотность стакана
+    tp_max_orders: int = 6               # не больше стольких тейк-профитов на одну позицию
+    tp_replace_ticks: int = 3            # переставляем ордер, только если уровень ушёл больше чем на N шагов цены
+    tp_actions_per_tick: int = 4         # не больше стольких операций с ордерами лесенки за тик на позицию
     close_workers: int = 8               # сколько позиций закрываем параллельно
     momentum_windows_sec: tuple = (60.0, 120.0)   # окна для приоритета: у кого прибыль выросла сильнее — закрываем первой
     # --- копирование позиций на другие счета ---
@@ -104,6 +122,16 @@ class Config:
             copy_tick_sec=_float("COPY_TICK_SEC", 1.0),
             copy_ratio_refresh_sec=_float("COPY_RATIO_REFRESH_SEC", 60.0),
             base_from_now=_bool("BASE_FROM_NOW", False),
+            use_websocket=_bool("USE_WEBSOCKET", False),
+            stream_max_age_sec=_float("STREAM_MAX_AGE_SEC", 3.0),
+            fast_tick_sec=_float("FAST_TICK_SEC", 0.25),
+            tp_ladder=_bool("TP_LADDER", False),
+            tp_coefs=_floats("TP_COEFS", (1.0, 1.3)),
+            tp_book_fraction=_float("TP_BOOK_FRACTION", 0.2),
+            tp_density_window_bps=_float("TP_DENSITY_WINDOW_BPS", 20.0),
+            tp_max_orders=int(_float("TP_MAX_ORDERS", 6)),
+            tp_replace_ticks=int(_float("TP_REPLACE_TICKS", 3)),
+            tp_actions_per_tick=int(_float("TP_ACTIONS_PER_TICK", 4)),
             copy_deadband_pct=_float("COPY_DEADBAND_PCT", 3.0),
             ui_password=_str("UI_PASSWORD", ""),
             ui_host=_str("UI_HOST", "127.0.0.1"),
@@ -113,6 +141,10 @@ class Config:
         return cfg
 
     def validate(self) -> None:
+        if self.tp_ladder and not self.tp_coefs:
+            raise ValueError("TP_COEFS не должен быть пустым")
+        if any(c <= 0 for c in self.tp_coefs):
+            raise ValueError("TP_COEFS должны быть > 0")
         if not 0 < self.book_fraction <= 1:
             raise ValueError("BOOK_FRACTION должен быть в (0, 1]")
         if self.target_profit_pct <= 0:

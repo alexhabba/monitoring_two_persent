@@ -67,10 +67,12 @@ def main() -> None:
         else:
             install_account_filter()
             copier = Copier.from_config(client, cfg)
+            bot.start_streams()
             bot.run(copier)
     except KeyboardInterrupt:
         logging.getLogger("main").info("Остановлено.")
     finally:
+        bot.stop_streams()
         if copier is not None:
             copier.close()
         store.close()

@@ -1035,3 +1035,204 @@ def test_account_label_reaches_closing_worker_threads(tmp_path):
           PositionView("C1USDT", "Buy", 3.0, 100.0, 100.0, 0.0, 1, 10.0)]
     closer.close_all(ps, {"C0USDT": make_book(100.0), "C1USDT": make_book(100.0)})
     assert seen == ["acc2", "acc2"]
+
+
+# ---------- WebSocket: обработка сообщений ----------
+from decimal import Decimal as _D  # noqa: E402
+
+from bot.ladder import LINK_PREFIX, TakeProfitLadder, plan_ladder  # noqa: E402
+from bot.stream import PrivateStream, PublicStream  # noqa: E402
+
+
+def test_public_stream_book_snapshot_delta_and_ticker_merge():
+    st = PublicStream()
+    st.handle({"topic": "orderbook.50.XUSDT", "type": "snapshot", "data": {
+        "s": "XUSDT", "b": [["99", "5"], ["98", "7"]], "a": [["101", "4"], ["102", "6"]], "u": 10}})
+    st.handle({"topic": "orderbook.50.XUSDT", "type": "delta", "data": {
+        "s": "XUSDT", "b": [["99", "0"], ["99.5", "2"]], "a": [["101", "9"]], "u": 11}})
+    b = st.book("XUSDT")
+    assert b["bids"] == [(99.5, 2.0), (98.0, 7.0)] and b["asks"] == [(101.0, 9.0), (102.0, 6.0)]
+    st.handle({"topic": "tickers.XUSDT", "type": "snapshot", "data": {"symbol": "XUSDT", "markPrice": "100.2", "lastPrice": "100.1"}})
+    st.handle({"topic": "tickers.XUSDT", "type": "delta", "data": {"symbol": "XUSDT", "lastPrice": "100.3"}})   # дельта — только изменённые поля
+    t = st.ticker("XUSDT")
+    assert t["markPrice"] == 100.2 and t["lastPrice"] == 100.3
+    st._book_ts["XUSDT"] = 0                                    # устарел — потоку не доверяем
+    assert st.book("XUSDT") is None
+
+
+def test_public_stream_crossed_book_is_rejected():
+    st = PublicStream()
+    st.handle({"topic": "orderbook.50.XUSDT", "type": "snapshot", "data": {
+        "s": "XUSDT", "b": [["102", "1"]], "a": [["101", "1"]], "u": 5}})
+    assert st.book("XUSDT") is None
+
+
+class _RestStub:
+    def get_positions(self, c, s): return [{"symbol": "XUSDT", "side": "Buy", "size": "10", "avgPrice": "100", "positionIdx": 1}]
+    def get_open_orders(self, c, s): return []
+
+
+def test_private_stream_positions_and_orders_apply_updates():
+    execs = []
+    st = PrivateStream("k", "s", _RestStub(), on_execution=execs.append)
+    st.resync()
+    assert st.positions()[0]["size"] == "10"
+    st.handle({"topic": "position.linear", "data": [{"symbol": "XUSDT", "positionIdx": 1, "side": "Buy", "size": "4",
+                                                      "entryPrice": "100.5", "markPrice": "101"}]})
+    p = st.positions()[0]
+    assert p["size"] == "4" and p["avgPrice"] == "100.5"        # entryPrice из потока → avgPrice как в REST
+    st.handle({"topic": "position.linear", "data": [{"symbol": "XUSDT", "positionIdx": 1, "side": "", "size": "0"}]})
+    assert st.positions() == []
+    st.handle({"topic": "order.linear", "data": [{"orderId": "o1", "symbol": "XUSDT", "orderStatus": "New", "price": "1", "qty": "1"}]})
+    assert [o["orderId"] for o in st.open_orders()] == ["o1"]
+    st.handle({"topic": "order.linear", "data": [{"orderId": "o1", "orderStatus": "Filled"}]})
+    assert st.open_orders() == []
+    st.handle({"topic": "execution.linear", "data": [{"orderLinkId": LINK_PREFIX + "1"}]})
+    assert execs and execs[0]["orderLinkId"].startswith(LINK_PREFIX)
+
+
+# ---------- лесенка тейк-профитов ----------
+LADDER_INSTR = {"min_qty": 1.0, "qty_step": "1", "tick_size": "0.1", "min_notional": 5.0}
+
+
+def ladder_book(mark=100.0):
+    return {"bids": [(mark - 0.1 * i, 500.0) for i in range(1, 30)],
+            "asks": [(mark + 0.1 * i, 100.0 + 50 * (i % 3)) for i in range(1, 80)]}
+
+
+def test_ladder_prices_follow_needed_gain_and_coefficients_for_long_and_short():
+    c = cfg(tp_coefs=(1.0, 1.3), tp_max_orders=2, tp_book_fraction=0.2, tp_density_window_bps=1)
+    # лонг 100 шт, mark 100, не хватает 10 USDT -> движение цены 0.1 (+комиссия): уровни ~100.1 и ~100.13
+    longs = plan_ladder("Buy", 100.0, 100.0, 10.0, ladder_book(100.0), LADDER_INSTR, c, maker_fee=0.0)
+    assert longs and all(s.price > 100 for s in longs)
+    assert sum(s.qty for s in longs) == _D(100)                  # весь объём позиции разложен по уровням
+    shorts = plan_ladder("Sell", 100.0, 100.0, 10.0, ladder_book(100.0), LADDER_INSTR, c, maker_fee=0.0)
+    assert shorts and all(s.price < 100 for s in shorts)         # шорт закрываем покупкой НИЖЕ рынка
+    assert sum(s.qty for s in shorts) == _D(100)
+    far = plan_ladder("Buy", 100.0, 100.0, 40.0, ladder_book(100.0), LADDER_INSTR, c, maker_fee=0.0)
+    assert min(s.price for s in far) > min(s.price for s in longs)          # чем больше нужно, тем дальше уровень
+
+
+def test_ladder_density_limits_slice_to_book_fraction_and_spreads_over_levels():
+    c = cfg(tp_coefs=(1.0,), tp_max_orders=6, tp_book_fraction=0.2, tp_density_window_bps=30)
+    book = ladder_book(100.0)
+    out = plan_ladder("Buy", 300.0, 100.0, 15.0, book, LADDER_INSTR, c, maker_fee=0.0)
+    assert len(out) > 1                                          # объём размазан по нескольким уровням стакана
+    assert sum(s.qty for s in out) == _D(300)
+    assert len({s.price for s in out}) == len(out)
+
+
+def test_ladder_empty_when_goal_already_reached_or_no_size():
+    c = cfg()
+    assert plan_ladder("Buy", 10.0, 100.0, 0.0, ladder_book(), LADDER_INSTR, c) == []
+    assert plan_ladder("Buy", 10.0, 100.0, -5.0, ladder_book(), LADDER_INSTR, c) == []
+    assert plan_ladder("Buy", 0.0, 100.0, 5.0, ladder_book(), LADDER_INSTR, c) == []
+
+
+def test_ladder_price_is_passive_never_inside_the_market():
+    c = cfg(tp_coefs=(1.0,))
+    out = plan_ladder("Buy", 100.0, 100.0, 0.001, ladder_book(100.0), LADDER_INSTR, c, maker_fee=0.0)   # цель почти достигнута
+    assert out and all(s.price > _D("99.9") for s in out)        # выше лучшего бида — не пересекает рынок
+
+
+class LadderFake:
+    def __init__(self):
+        self.orders, self.cancelled, self.amended, self.n = {}, [], [], 0
+
+    def place_limit_order(self, c, symbol, side, qty, price, idx, link, reduce_only):
+        self.n += 1
+        oid = f"t{self.n}"
+        assert reduce_only
+        self.orders[oid] = {"orderId": oid, "symbol": symbol, "side": side, "qty": qty, "leavesQty": qty, "price": price,
+                            "positionIdx": idx, "orderLinkId": link, "reduceOnly": True}
+        return oid
+
+    def amend_order(self, c, s, oid, price, qty):
+        self.amended.append(oid)
+        self.orders[oid].update(price=price, qty=qty, leavesQty=qty)
+
+    def cancel_order(self, c, s, oid):
+        self.cancelled.append(oid)
+        self.orders.pop(oid, None)
+
+
+def make_ladder(fake, **kw):
+    c = cfg(tp_coefs=(1.0, 1.3), tp_max_orders=4, tp_book_fraction=0.3, tp_density_window_bps=20, **kw)
+    return TakeProfitLadder(fake, c, lambda s: LADDER_INSTR, lambda: list(fake.orders.values()), lambda s: 0.0)
+
+
+def lpos(size=100.0, mark=100.0, side="Buy", idx=0):
+    return PositionView("XUSDT", side, size, 100.0, mark, 0.0, idx, 10.0)
+
+
+def test_ladder_places_then_keeps_then_amends_and_cancels():
+    fake = LadderFake()
+    lad = make_ladder(fake)
+    lad.tick([lpos()], {"XUSDT": ladder_book(100.0)}, 10.0)
+    first = dict(fake.orders)
+    assert first and all(o["side"] == "Sell" and o["orderLinkId"].startswith(LINK_PREFIX) for o in first.values())
+    assert sum(float(o["qty"]) for o in first.values()) == 100.0
+    lad.tick([lpos()], {"XUSDT": ladder_book(100.0)}, 10.0)                  # ничего не изменилось
+    assert fake.orders == first and not fake.amended and not fake.cancelled
+    lad.tick([lpos()], {"XUSDT": ladder_book(100.0)}, 10.05)                 # крошечный дрейф: в пределах допуска — не трогаем
+    assert not fake.amended and not fake.cancelled
+    lad.tick([lpos()], {"XUSDT": ladder_book(100.0)}, 40.0)                  # недостающее выросло — уровни уходят дальше
+    assert fake.amended and not fake.cancelled
+    lad.tick([lpos(size=0.5)], {"XUSDT": ladder_book(100.0)}, 40.0) if False else None
+    lad.tick([], {}, 40.0)                                                   # позиция закрылась — ордера сняты
+    assert not fake.orders and fake.cancelled
+
+
+def test_ladder_is_cancelled_when_goal_is_reached():
+    fake = LadderFake()
+    lad = make_ladder(fake)
+    lad.tick([lpos()], {"XUSDT": ladder_book(100.0)}, 10.0)
+    assert fake.orders
+    lad.tick([lpos()], {"XUSDT": ladder_book(100.0)}, 0.0)                   # недостающего нет — цель достигнута
+    assert not fake.orders
+
+
+# ---------- Bot.fast_tick с потоками-заглушками ----------
+class _Pub:
+    def __init__(self, mark=100.0): self.mark, self.ensured = mark, set()
+    def healthy(self, a=3.0): return True
+    def ensure(self, s): self.ensured |= set(s)
+    def ticker(self, sym, max_age=3.0): return {"markPrice": self.mark}
+    def book(self, sym, max_age=3.0): return ladder_book(self.mark)
+
+
+class _Priv:
+    def __init__(self, positions): self._p = positions
+    def healthy(self, a=5.0): return True
+    def positions(self): return self._p
+    def open_orders(self): return []
+    def maybe_resync(self, every=60.0): pass
+
+
+def fast_bot(tmp_path, tp=True, **kw):
+    cl = FakeClient(legs={0: ["Buy", 0.0, 100.0]})
+    bot, store, clock = make_bot(cl, tmp_path, target_profit_pct=2.0, **kw)
+    bot.step()                                              # создаёт день: база 500, цель +10 USDT
+    bot.pub, bot.priv = _Pub(100.0), _Priv([{"symbol": "XUSDT", "side": "Buy", "size": "100", "avgPrice": "100", "positionIdx": 0}])
+    fake = LadderFake()
+    bot.ladder = make_ladder(fake) if tp else None
+    return bot, fake
+
+
+def test_fast_tick_places_ladder_while_below_goal_and_wakes_when_goal_reached(tmp_path):
+    bot, fake = fast_bot(tmp_path)
+    bot.fast_tick()
+    assert fake.orders and not bot._wake.is_set()          # цель не достигнута: лесенка стоит, будить шаг не нужно
+    bot.pub.mark = 100.2                                   # +20 по позиции 100 шт => результат выше цели (+10)
+    bot._last_fast_wake = 0.0
+    bot.fast_tick()
+    assert bot._wake.is_set()                              # цель по живым ценам — сразу полный шаг
+
+
+def test_fast_tick_cancels_ladder_when_goal_is_latched(tmp_path):
+    bot, fake = fast_bot(tmp_path)
+    bot.fast_tick()
+    assert fake.orders
+    bot.goal_latched = True
+    bot.fast_tick()
+    assert not fake.orders

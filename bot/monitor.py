@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -9,6 +10,7 @@ from datetime import datetime
 
 from .bybit_client import BybitClient
 from .closer import PositionCloser
+from .ladder import LINK_PREFIX as TP_PREFIX, TakeProfitLadder
 from .config import Config
 from .daypnl import INCLUDED_TYPES, DayPnlTracker
 from .pnl import Evaluation, Key, PositionView, evaluate, parse_position
@@ -20,7 +22,7 @@ log = logging.getLogger("monitor")
 
 class Bot:
     def __init__(self, client: BybitClient, cfg: Config, store: StateStore,
-                 closer: PositionCloser | None = None, clock=None):
+                 closer: PositionCloser | None = None, clock=None, live_data: bool = True):
         self.client = client
         self.cfg = cfg
         self.store = store
@@ -35,6 +37,21 @@ class Bot:
         self._hist: deque[tuple[float, dict[Key, float]]] = deque()   # (monotonic, {позиция: нереализованный PnL})
         self._pending_final = False  # закрывали позиции после цели — нужно записать итог дня
         self.closing = False
+        # --- WebSocket и лесенка тейк-профитов (только основной счёт: live_data=False у копий) ---
+        self.pub = self.priv = self.ladder = None
+        self._wake = threading.Event()          # «пора проверить прямо сейчас» (исполнился тейк-профит, цель по живым данным)
+        self._day_row: dict | None = None
+        self._last_realized = 0.0
+        self.goal_latched = False
+        self._ladder_off = False
+        self._last_fast_wake = 0.0
+        if live_data and cfg.use_websocket:
+            from .stream import PrivateStream, PublicStream
+            self.pub = PublicStream(testnet=cfg.testnet)
+            self.priv = PrivateStream(cfg.api_key, cfg.api_secret, client, cfg.category, cfg.settle_coin, cfg.testnet,
+                                      on_execution=self._on_execution)
+            if cfg.tp_ladder and not cfg.dry_run:
+                self.ladder = TakeProfitLadder(client, cfg, self.closer.instrument, self._open_orders)
 
     # ---------- вспомогательное ----------
     def _taker_fee(self, symbol: str) -> float:
@@ -101,7 +118,54 @@ class Bot:
         self._pending_final = False
         return self.store.get_day(day)
 
+    def start_streams(self) -> None:
+        if self.pub is not None:
+            self.pub.start()
+            self.priv.start()
+            log.info("WebSocket включён (стакан/позиции/исполнения), лесенка тейк-профитов: %s",
+                     f"вкл, коэффициенты {self.cfg.tp_coefs}" if self.ladder else "выкл")
+
+    def stop_streams(self) -> None:
+        for st in (self.pub, self.priv):
+            if st is not None:
+                st.stop()
+
+    def _on_execution(self, e: dict) -> None:
+        if str(e.get("orderLinkId", "")).startswith(TP_PREFIX):
+            self._wake.set()                    # тейк-профит исполнился — сразу пересчитать результат дня
+
+    def _streams_ok(self) -> bool:
+        return (self.pub is not None and self.priv is not None and self.priv.healthy(35.0)
+                and self.pub.healthy(self.cfg.stream_max_age_sec))
+
+    def _open_orders(self) -> list[dict]:
+        if self.priv is not None and self.priv.healthy(35.0):
+            return self.priv.open_orders()
+        return self.client.get_open_orders(self.cfg.category, self.cfg.settle_coin)
+
+    def _live_positions(self) -> list[PositionView] | None:
+        """Позиции из потока с ценой mark из тикера (нереализованный PnL считаем сами). None — данным нельзя доверять."""
+        if not self._streams_ok():
+            return None
+        raws = self.priv.positions()
+        self.pub.ensure({r["symbol"] for r in raws})
+        out = []
+        for r in raws:
+            tk = self.pub.ticker(r["symbol"], self.cfg.stream_max_age_sec)
+            if tk is None:
+                return None
+            size, avg, mark = float(r["size"]), float(r.get("avgPrice") or 0), tk["markPrice"]
+            raw = dict(r)
+            raw.update(markPrice=str(mark), unrealisedPnl=str((mark - avg) * size if r["side"] == "Buy" else (avg - mark) * size))
+            out.append(parse_position(raw))
+        return out
+
     def _books(self, symbols: set[str]) -> dict[str, dict]:
+        if self.pub is not None and symbols:
+            self.pub.ensure(symbols)
+            got = {s: self.pub.book(s, self.cfg.stream_max_age_sec) for s in symbols}
+            if all(b is not None for b in got.values()):
+                return got                      # все стаканы из потока — без запросов REST
         if len(symbols) <= 1:
             return {s: self.client.get_orderbook(self.cfg.category, s, self.cfg.book_limit) for s in symbols}
         with ThreadPoolExecutor(max_workers=min(len(symbols), 8)) as ex:   # стаканы всех монет сразу, а не по очереди
@@ -158,6 +222,7 @@ class Bot:
         day = self._ensure_day(now, equity, sum(p.unrealised_pnl for p in positions))
 
         ev, books = self._evaluate(day, now, positions, equity)
+        self._day_row, self._last_realized = day, ev.realized
 
         goal = ev.pct >= cfg.target_profit_pct
         if goal:
@@ -169,6 +234,7 @@ class Bot:
                         ev.gain, ev.pct, cfg.target_profit_pct, ev.start_equity,
                         " [DRY-RUN: ордера не отправляются]" if cfg.dry_run else "")
         ev.goal = goal
+        self.goal_latched = goal
         self.closing = goal and bool(positions)
 
         log.info("%s | результат дня %+.4f (%+.3f%% / цель %.2f%%) = реализ. %+.4f + нереализ. Δ %+.4f + выход %+.4f"
@@ -189,6 +255,8 @@ class Bot:
         positions = [parse_position(r) for r in self.client.get_positions(cfg.category, cfg.settle_coin)]
         self._remember(positions)
         ev, books = self._evaluate(row, now, positions, 0.0)
+        self._day_row, self._last_realized = row, ev.realized
+        self.goal_latched = ev.pct >= cfg.target_profit_pct
         if ev.pct < cfg.target_profit_pct:
             self.closer.cancel_all()    # живые ордера на закрытие больше не нужны: цель снята
             self.store.clear_goal(row["day"])
@@ -252,25 +320,67 @@ class Bot:
         except Exception:  # одна неудачная лимитка не должна ронять бота
             log.exception("Ошибка при закрытии позиций")
 
+    # ---------- быстрая проверка по живым данным (WebSocket) ----------
+    def fast_tick(self) -> None:
+        """Раз в `fast_tick_sec`: цель по живым ценам (если достигнута — сразу полный шаг) и лесенка тейк-профитов."""
+        cfg, row = self.cfg, self._day_row
+        if row is None or not self._streams_ok():
+            return
+        positions = self._live_positions()
+        if positions is None:
+            return
+        self.priv.maybe_resync()
+        target_gain = row["start_equity"] * cfg.target_profit_pct / 100
+        current = self._last_realized + sum(p.unrealised_pnl for p in positions) - row["start_unrealised"]
+        need = target_gain - current
+        if positions and not self.goal_latched and need <= 0 and time.monotonic() - self._last_fast_wake > 1.0:
+            self._last_fast_wake = time.monotonic()
+            log.info("Цель по живым данным: результат %+.4f >= %+.4f USDT — проверяем и закрываем сразу", current, target_gain)
+            self._wake.set()
+        if self.ladder is None:
+            return
+        if self.goal_latched:                   # цель достигнута: лесенка снимается, дальше закрывает обычный механизм
+            if not self._ladder_off:
+                self._ladder_off = True
+                self.ladder.cancel_all()
+            return
+        self._ladder_off = False
+        books = {p.symbol: self.pub.book(p.symbol, cfg.stream_max_age_sec) for p in positions}
+        self.ladder.tick(positions, books, need)
+
     # ---------- цикл ----------
     def run(self, copier=None) -> None:
         mode = "DRY-RUN (ордера не отправляются)" if self.cfg.dry_run else "БОЕВОЙ РЕЖИМ"
         log.info("Старт. Режим: %s | testnet=%s | цель +%.2f%% в день | пояс %s | состояние: %s",
                  mode, self.cfg.testnet, self.cfg.target_profit_pct, self.cfg.timezone, self.cfg.state_path)
+        row = self.store.get_day(self.clock().date().isoformat())
+        if row:
+            self._day_row, self.goal_latched = row, bool(row["goal_reached"])
+        last_copy = 0.0
         while True:
+            self._wake.clear()
             try:
                 self.step()
             except Exception:
                 log.exception("Ошибка шага мониторинга")
             fast = self.closing and not self.cfg.dry_run
             end = time.monotonic() + (self.cfg.close_loop_sleep_sec if fast else self.cfg.poll_interval_sec)
-            while True:   # между шагами основного счёта копии сверяются каждую секунду
-                if copier is not None:
+            while True:   # между шагами: копии сверяются раз в секунду, быстрая проверка/лесенка — несколько раз в секунду
+                now = time.monotonic()
+                if copier is not None and now - last_copy >= self.cfg.copy_tick_sec:
+                    last_copy = now
                     try:
                         copier.tick(self.store.has_goal_event(self.clock().date().isoformat()))
                     except Exception:
                         log.exception("Ошибка копирования")
+                if self.pub is not None:
+                    try:
+                        self.fast_tick()
+                    except Exception:
+                        log.exception("Ошибка быстрой проверки")
                 remaining = end - time.monotonic()
-                if remaining <= 0:
+                if remaining <= 0 or self._wake.is_set():
                     break
-                time.sleep(min(self.cfg.copy_tick_sec, remaining) if copier is not None else remaining)
+                tick = self.cfg.fast_tick_sec if self.pub is not None else (
+                    self.cfg.copy_tick_sec if copier is not None else remaining)
+                self._wake.wait(min(tick, remaining))
