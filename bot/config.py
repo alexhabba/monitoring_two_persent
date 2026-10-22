@@ -64,7 +64,7 @@ class Config:
     stream_max_age_sec: float = 3.0      # данные старше — считаем устаревшими и идём в REST
     fast_tick_sec: float = 0.25          # частота быстрой проверки (цель по живым данным, лесенка)
     tp_ladder: bool = False              # заранее выставленные тейк-профиты на цену, где счёт достигнет цели
-    tp_goal_coef: float = 1.3            # пачка тейк-профитов стоит там, где результат дня = коэффициент × цель дня
+    tp_goal_coef: float = 2.0            # пачка тейк-профитов стоит там, где результат дня = коэффициент × цель дня
     tp_book_fraction: float = 0.2        # не больше этой доли видимой заявки стакана на одном уровне
     tp_density_window_bps: float = 20.0  # окно (б.п.) от уровня, где ищем плотность стакана
     tp_ladder_followers: bool = False    # пачка тейк-профитов и на копирующих счетах (каждая со своей целью)
@@ -135,7 +135,7 @@ class Config:
             fast_tick_sec=_float("FAST_TICK_SEC", 0.25),
             tp_ladder=_bool("TP_LADDER", False),
             tp_ladder_followers=_bool("TP_LADDER_FOLLOWERS", False),
-            tp_goal_coef=_float("TP_GOAL_COEF", 1.3),
+            tp_goal_coef=_float("TP_GOAL_COEF", 2.0),
             tp_book_fraction=_float("TP_BOOK_FRACTION", 0.2),
             tp_density_window_bps=_float("TP_DENSITY_WINDOW_BPS", 20.0),
             tp_max_orders=int(_float("TP_MAX_ORDERS", 6)),

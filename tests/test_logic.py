@@ -1260,7 +1260,7 @@ def test_start_streams_logs_and_starts_both_streams_with_ladder_enabled(tmp_path
     bot.priv.start = lambda: started.append("priv")
     with caplog.at_level("INFO"):
         bot.start_streams()
-    assert started == ["pub", "priv"] and any("пачка на 1.3" in r.getMessage() for r in caplog.records)
+    assert started == ["pub", "priv"] and any("пачка на 2.0" in r.getMessage() for r in caplog.records)
 
 
 def test_ladder_is_cancelled_before_the_closing_engine_places_orders(tmp_path):
