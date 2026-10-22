@@ -1272,3 +1272,74 @@ def test_ladder_is_cancelled_before_the_closing_engine_places_orders(tmp_path):
     bot.closer.close_all = lambda ps, books: (seen.append(len(fake.orders)), orig(ps, books))[1]
     bot._close_all([lpos()], {"XUSDT": ladder_book(100.0)})
     assert seen == [0]                                        # к моменту первого закрывающего ордера пачки уже нет
+
+
+# ---------- закрытие пачкой: вся позиция сразу ----------
+from bot.ladder import CLOSE_PREFIX, ClosePack, plan_close_pack  # noqa: E402
+
+
+def test_close_pack_covers_whole_position_starting_at_best_price_long_and_short():
+    c = cfg(close_pack_max_orders=5, close_pack_window_bps=30, close_pack_fraction=0.3)
+    longp = plan_close_pack("Buy", 300.0, ladder_book(100.0), LADDER_INSTR, c)
+    assert len(longp) >= 2 and sum(s.qty for s in longp) == _D(300)
+    assert longp[0].price == _D("100.1")                       # первая часть — на лучшей цене продажи (best ask), мейкер
+    assert all(s.price >= _D("100.1") for s in longp) and len(longp) <= 5
+    shortp = plan_close_pack("Sell", 300.0, ladder_book(100.0), LADDER_INSTR, c)
+    assert shortp[0].price == _D("99.9") and all(s.price <= _D("99.9") for s in shortp)   # шорт: покупаем у best bid и ниже
+    assert sum(s.qty for s in shortp) == _D(300)
+    assert plan_close_pack("Buy", 300.0, None, LADDER_INSTR, c) == []
+
+
+def test_close_pack_manager_places_all_then_follows_best_price_with_amend():
+    fake = LadderFake()
+    c = cfg(close_pack=True, close_pack_max_orders=4, close_pack_window_bps=30, close_pack_fraction=0.3)
+    pack = ClosePack(fake, c, lambda s: LADDER_INSTR, lambda: list(fake.orders.values()))
+    pos = lpos(size=300.0)
+    pack.tick([pos], {"XUSDT": ladder_book(100.0)}, 1.0)
+    assert fake.orders and all(o["orderLinkId"].startswith(CLOSE_PREFIX) for o in fake.orders.values())
+    assert sum(float(o["qty"]) for o in fake.orders.values()) == 300.0          # вся позиция сразу, а не кусок
+    first = dict(fake.orders)
+    pack.tick([pos], {"XUSDT": ladder_book(100.0)}, 1.0)                        # рынок не двигался — ничего не трогаем
+    assert fake.orders == first and not fake.amended
+    pack.tick([pos], {"XUSDT": ladder_book(99.6)}, 1.0)                         # рынок ушёл вниз — переставляем вслед
+    assert fake.amended and min(float(o["price"]) for o in fake.orders.values()) < 100.0
+
+
+class PackFake(MultiFake):
+    """Позиции MultiFake + ордера пачки (стоят в стакане, не исполняются)."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.pk, self.n, self.amended, self.cancelled = {}, 0, [], []
+
+    def place_limit_order(self, c, symbol, side, qty, price, idx, link, reduce_only):
+        self.n += 1
+        oid = f"p{self.n}"
+        self.pk[oid] = {"orderId": oid, "symbol": symbol, "side": side, "qty": qty, "leavesQty": qty, "price": price,
+                        "positionIdx": idx, "orderLinkId": link, "reduceOnly": True}
+        return oid
+
+    def get_open_orders(self, category, settle): return list(self.pk.values())
+
+    def amend_order(self, c, s, oid, price, qty):
+        self.amended.append(oid)
+        self.pk[oid].update(price=price, qty=qty, leavesQty=qty)
+
+    def cancel_order(self, c, s, oid):
+        self.cancelled.append(oid)
+        self.pk.pop(oid, None)
+
+
+def test_goal_closes_every_position_with_a_pack_in_one_step_and_cancel_removes_it(tmp_path):
+    cl = PackFake(legs={0: ["Buy", 3.0, 100.0], 1: ["Buy", 3.0, 100.0], 2: ["Buy", 3.0, 100.0]})
+    bot, store, clock = make_bot(cl, tmp_path, close_pack=True)
+    bot.step()                          # база
+    cl.add_realized(20.0)               # цель достигнута
+    bot.step()
+    by_idx = {}
+    for o in cl.pk.values():
+        by_idx[o["positionIdx"]] = by_idx.get(o["positionIdx"], 0.0) + float(o["qty"])
+    assert by_idx == {0: 3.0, 1: 3.0, 2: 3.0}          # на КАЖДУЮ позицию выставлена пачка на весь её объём
+    assert all(o["orderLinkId"].startswith(CLOSE_PREFIX) for o in cl.pk.values())
+    bot.closer.cancel_all()                            # цель снята — пачка снимается
+    assert not cl.pk

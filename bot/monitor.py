@@ -39,6 +39,8 @@ class Bot:
         self.closing = False
         # --- WebSocket и лесенка тейк-профитов (только основной счёт: live_data=False у копий) ---
         self.pub = self.priv = self.ladder = None
+        if live_data:
+            self.closer.open_orders_fn = self._open_orders      # список ордеров из потока, при сбое — REST
         self._wake = threading.Event()          # «пора проверить прямо сейчас» (исполнился тейк-профит, цель по живым данным)
         self._day_row: dict | None = None
         self._last_realized = 0.0

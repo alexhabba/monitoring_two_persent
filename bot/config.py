@@ -70,6 +70,13 @@ class Config:
     tp_max_orders: int = 6               # не больше стольких тейк-профитов на одну позицию
     tp_replace_ticks: int = 3            # переставляем ордер, только если уровень ушёл больше чем на N шагов цены
     tp_actions_per_tick: int = 4         # не больше стольких операций с ордерами лесенки за тик на позицию
+    # --- закрытие по цели пачкой (вся позиция сразу несколькими лимитками) ---
+    close_pack: bool = False             # True: после цели ставим на закрытие сразу всю позицию пачкой, а не по куску за секунду
+    close_pack_max_orders: int = 5       # не больше стольких ордеров на позицию
+    close_pack_window_bps: float = 15.0  # пачка лежит в пределах N б.п. от лучшей цены
+    close_pack_fraction: float = 0.3     # не больше этой доли видимой заявки на уровне (если хватает места)
+    close_replace_ticks: int = 1         # переставляем, когда лучшая цена ушла больше чем на N шагов
+    close_actions_per_tick: int = 6      # не больше стольких операций с ордерами за тик на позицию
     close_workers: int = 8               # сколько позиций закрываем параллельно
     momentum_windows_sec: tuple = (60.0, 120.0)   # окна для приоритета: у кого прибыль выросла сильнее — закрываем первой
     # --- копирование позиций на другие счета ---
@@ -132,6 +139,12 @@ class Config:
             tp_max_orders=int(_float("TP_MAX_ORDERS", 6)),
             tp_replace_ticks=int(_float("TP_REPLACE_TICKS", 3)),
             tp_actions_per_tick=int(_float("TP_ACTIONS_PER_TICK", 4)),
+            close_pack=_bool("CLOSE_PACK", False),
+            close_pack_max_orders=int(_float("CLOSE_PACK_MAX_ORDERS", 5)),
+            close_pack_window_bps=_float("CLOSE_PACK_WINDOW_BPS", 15.0),
+            close_pack_fraction=_float("CLOSE_PACK_FRACTION", 0.3),
+            close_replace_ticks=int(_float("CLOSE_REPLACE_TICKS", 1)),
+            close_actions_per_tick=int(_float("CLOSE_ACTIONS_PER_TICK", 6)),
             copy_deadband_pct=_float("COPY_DEADBAND_PCT", 3.0),
             ui_password=_str("UI_PASSWORD", ""),
             ui_host=_str("UI_HOST", "127.0.0.1"),

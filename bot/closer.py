@@ -122,6 +122,8 @@ class PositionCloser:
         self._err_at: dict[str, float] = {}
         self._dry_logged: dict[Key, str] = {}
         self.account: str | None = None      # имя копирующего счёта — для меток в логе
+        self.open_orders_fn = None           # () -> активные ордера (поток WebSocket, если есть); иначе REST
+        self._pack = None
 
     def instrument(self, symbol: str) -> dict:
         if symbol not in self._instruments:
@@ -171,6 +173,9 @@ class PositionCloser:
         cfg = self.cfg
         if not positions:
             return
+        if cfg.close_pack and not cfg.dry_run:
+            self._close_pack(positions, books)
+            return
         fractions = self._hedge_fractions(positions, books)
         if cfg.dry_run:
             for p in positions:
@@ -192,6 +197,18 @@ class PositionCloser:
             futs = [ex.submit(self._safe_work, p, books[p.symbol], fractions.get(p.key)) for p in positions]
             for f in futs:
                 f.result()
+
+    def _close_pack(self, positions: list[PositionView], books: dict[str, dict]) -> None:
+        """Вся позиция сразу пачкой лимиток у лучшей цены (первая часть на самой цене), переставляем вслед за рынком."""
+        if self._pack is None:
+            from .ladder import ClosePack   # импорт здесь: ladder импортирует closer
+            self._pack = ClosePack(self.client, self.cfg, self.instrument, self._pack_orders)
+        self._pack.tick(positions, books, 1.0)
+
+    def _pack_orders(self) -> list[dict]:
+        if self.open_orders_fn is not None:
+            return self.open_orders_fn()
+        return self.client.get_open_orders(self.cfg.category, self.cfg.settle_coin)
 
     def _hedge_fractions(self, positions: list[PositionView], books: dict[str, dict]) -> dict[Key, float]:
         """Обе ноги одного символа закрываем в одной и той же доле, чтобы не остаться с перекошенным хеджем."""
@@ -277,6 +294,8 @@ class PositionCloser:
         """Снять все наши ордера на закрытие (когда цель снята и закрывать больше не нужно)."""
         if self.cfg.dry_run:
             return
+        if self._pack is not None:
+            self._pack.cancel_all()
         try:
             self._sync_open_orders()   # подхватит и «осиротевшие» ордера от прошлого запуска
         except BybitError:

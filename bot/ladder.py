@@ -71,41 +71,43 @@ def plan_ladder(side: str, size: float, mark: float, need_gain: float, book: dic
     if not anchors:
         return []
 
-    # плотность стакана вокруг каждого уровня: уровни на «выходной» стороне, начиная с цены якоря и дальше от рынка
+    return _cluster(long_, total, px, book, instrument, cfg.tp_density_window_bps, cfg.tp_book_fraction,
+                    cfg.tp_max_orders, nearest=False)
+
+
+def _cluster(long_: bool, total: Decimal, px: Decimal, book: dict | None, instrument: dict, window_bps: float,
+             fraction: float, slots: int, nearest: bool) -> list[Slice]:
+    """Раскладывает `total` по уровням стакана у цены `px` (и дальше от рынка в пределах window_bps).
+
+    Объём каждого уровня ∝ плотности заявок на нём (не больше `fraction` видимой заявки, если хватает ёмкости).
+    nearest=True — берём ближайшие к рынку уровни (закрытие: первая часть на самой лучшей цене),
+    иначе — самые плотные (тейк-профит: прятаться за крупными заявками).
+    """
+    step = Decimal(str(instrument["qty_step"]))
+    min_qty = Decimal(str(instrument["min_qty"]))
     levels = []
     if book:
         side_book = book["asks"] if long_ else book["bids"]
         levels = [(Decimal(repr(p)), Decimal(repr(q))) for p, q in side_book]
-    window = Decimal(str(cfg.tp_density_window_bps)) / Decimal(10_000)
-    per_anchor: list[list[tuple[Decimal, Decimal]]] = []    # [(цена, ёмкость)]
-    for _, px in anchors:
-        lim = px * (1 + window) if long_ else px * (1 - window)
-        near = [(p, q * Decimal(str(cfg.tp_book_fraction))) for p, q in levels
-                if (px <= p <= lim if long_ else lim <= p <= px)]
-        near.sort(key=lambda x: x[0], reverse=not long_)               # ближе к рынку сначала
-        per_anchor.append(near or [(px, total)])                      # стакан не доходит до уровня — один ордер на уровне
-
-    # доли между уровнями лесенки ∝ суммарной ёмкости стакана около каждого
-    caps = [sum(q for _, q in lv) for lv in per_anchor]
-    caps = [c if c > 0 else total for c in caps]
-    tot_cap = sum(caps)
-    slots = max(1, cfg.tp_max_orders // len(anchors))
+    window = Decimal(str(window_bps)) / Decimal(10_000)
+    lim = px * (1 + window) if long_ else px * (1 - window)
+    near = [(p, q * Decimal(str(fraction))) for p, q in levels if (px <= p <= lim if long_ else lim <= p <= px)]
+    near.sort(key=lambda x: x[0], reverse=not long_)                  # ближе к рынку сначала
+    if not near:
+        near = [(px, total)]                                          # стакан не доходит до уровня — один ордер на уровне
+    pick = near[:slots] if nearest else sorted(near, key=lambda x: -x[1])[:slots]
+    cap = sum(q for _, q in pick) or total
     out: dict[Decimal, Decimal] = {}
-    for lv, cap in zip(per_anchor, caps):
-        share = total * cap / tot_cap
-        lv = sorted(lv, key=lambda x: -x[1])[:slots]                     # самые плотные уровни, не больше slots
-        lcap = sum(q for _, q in lv) or share
-        for p, q in lv:
-            out[p] = out.get(p, Decimal(0)) + _floor_to_step(share * (q / lcap), step)
+    for p, q in pick:
+        out[p] = out.get(p, Decimal(0)) + _floor_to_step(total * q / cap, step)
     # остаток округления — на ближайший к рынку уровень; слишком мелкие куски сливаем с ближайшим
     order = sorted(out, reverse=not long_)
     rest = total - sum(out.values())
     if rest > 0:
         out[order[0]] += _floor_to_step(rest, step)
-    small = [p for p in order if out[p] < min_qty]
-    for p in small:
+    for p in [p for p in order if out[p] < min_qty]:
         q = out.pop(p)
-        keep = [x for x in sorted(out, key=lambda x: abs(x - p))]
+        keep = sorted(out, key=lambda x: abs(x - p))
         if keep:
             out[keep[0]] += q
         else:
@@ -113,10 +115,28 @@ def plan_ladder(side: str, size: float, mark: float, need_gain: float, book: dic
     return [Slice(p, out[p]) for p in sorted(out, reverse=not long_) if out[p] >= min_qty]
 
 
+def plan_close_pack(side: str, size: float, book: dict | None, instrument: dict, cfg: Config) -> list[Slice]:
+    """Пачка на ЗАКРЫТИЕ всей позиции: первая часть на лучшей цене своей стороны (мейкер), остальные — вплотную дальше от рынка."""
+    long_ = side == "Buy"
+    step = Decimal(str(instrument["qty_step"]))
+    min_qty = Decimal(str(instrument["min_qty"]))
+    total = _floor_to_step(Decimal(repr(size)), step)
+    if total < min_qty or not book:
+        return []
+    best = Decimal(repr(book["asks"][0][0] if long_ else book["bids"][0][0]))
+    return _cluster(long_, total, best, book, instrument, cfg.close_pack_window_bps, cfg.close_pack_fraction,
+                    cfg.close_pack_max_orders, nearest=True)
+
+
 class TakeProfitLadder:
     """Держит на бирже лесенку тейк-профитов: ставит, переставляет (с гистерезисом) и снимает."""
 
+    prefix = LINK_PREFIX
+    label = "тейк-профит"
+
     def __init__(self, client: BybitClient, cfg: Config, instrument_fn, open_orders_fn, fee_fn=None):
+        self.replace_ticks = cfg.tp_replace_ticks
+        self.actions_per_tick = cfg.tp_actions_per_tick
         self.client = client
         self.cfg = cfg
         self.instrument = instrument_fn          # symbol -> {tick_size, qty_step, min_qty, ...}
@@ -159,7 +179,7 @@ class TakeProfitLadder:
     def _my_orders(self) -> dict[Key, list[dict]]:
         out: dict[Key, list[dict]] = {}
         for o in self.open_orders():
-            if str(o.get("orderLinkId", "")).startswith(LINK_PREFIX):
+            if str(o.get("orderLinkId", "")).startswith(self.prefix):
                 out.setdefault((o["symbol"], int(o.get("positionIdx") or 0)), []).append(o)
         return out
 
@@ -174,7 +194,7 @@ class TakeProfitLadder:
         now = time.monotonic()
         if now - self._err_at.get(symbol, -1e9) >= ERR_LOG_EVERY_SEC:
             self._err_at[symbol] = now
-            log.error("%s: лесенка тейк-профитов — %s%s", symbol, e,
+            log.error("%s: %s — %s%s", symbol, self.label, e,
                       "  (ключ не имеет права торговать этой монетой)" if e.code == 10029 else "")
 
     def _reconcile(self, p: PositionView, book: dict | None, need_gain: float, existing: list[dict]) -> None:
@@ -187,7 +207,7 @@ class TakeProfitLadder:
             return
         close_side = p.close_side
         free = list(existing)
-        keep_tol = tick * self.cfg.tp_replace_ticks
+        keep_tol = tick * self.replace_ticks
         to_place: list[Slice] = []
         amends: list[tuple[dict, Slice]] = []
         for sl in want:
@@ -201,7 +221,7 @@ class TakeProfitLadder:
             same_qty = abs(q_old - sl.qty) <= max(sl.qty * Decimal("0.4"), Decimal(str(inst["min_qty"])))   # объём — с широким допуском: перекладка по плотности не должна терять очередь
             if not (same_price and same_qty):
                 amends.append((best, sl))
-        budget = self.cfg.tp_actions_per_tick
+        budget = self.actions_per_tick
         for o in free:                           # лишние снимаем в первую очередь (освобождают объём под reduce-only)
             self._cancel(o)
         for o, sl in amends[:budget]:
@@ -212,17 +232,22 @@ class TakeProfitLadder:
 
     def _plan(self, p: PositionView, book: dict | None, need_gain: float, inst: dict, tick: Decimal) -> list[Slice]:
         """План уровней с гистерезисом: пока якоря сместились не больше допуска, а размер позиции тот же — прежний план."""
-        fee = self.fee(p.symbol)
-        delta = (need_gain + fee * p.mark_price * p.size) / p.size if p.size > 0 else 0.0
-        sign = 1 if p.side == "Buy" else -1
-        anchors = [p.mark_price + sign * delta]
-        tol = float(tick) * self.cfg.tp_replace_ticks
+        anchors = [self._anchor(p, book, need_gain)]
+        tol = float(tick) * self.replace_ticks
         old = self._cache.get(p.key)
         if old and old[1] == p.size and len(old[0]) == len(anchors) and all(abs(a - b) <= tol for a, b in zip(anchors, old[0])):
             return old[2]
-        want = plan_ladder(p.side, p.size, p.mark_price, need_gain, book, inst, self.cfg, fee)
+        want = self._slices(p, book, need_gain, inst)
         self._cache[p.key] = (anchors, p.size, want)
         return want
+
+    def _anchor(self, p: PositionView, book: dict | None, need_gain: float) -> float:
+        fee = self.fee(p.symbol)
+        delta = (need_gain + fee * p.mark_price * p.size) / p.size if p.size > 0 else 0.0
+        return p.mark_price + (delta if p.side == "Buy" else -delta)
+
+    def _slices(self, p: PositionView, book: dict | None, need_gain: float, inst: dict) -> list[Slice]:
+        return plan_ladder(p.side, p.size, p.mark_price, need_gain, book, inst, self.cfg, self.fee(p.symbol))
 
     def _amend(self, p: PositionView, o: dict, sl: Slice) -> None:
         tick = self.instrument(p.symbol)["tick_size"]
@@ -236,8 +261,31 @@ class TakeProfitLadder:
     def _place(self, p: PositionView, close_side: str, sl: Slice) -> None:
         self._seq += 1
         tick = self.instrument(p.symbol)["tick_size"]
-        link = f"{LINK_PREFIX}{int(time.time())}-{self._seq}"
+        link = f"{self.prefix}{int(time.time())}-{self._seq}"
         self.client.place_limit_order(self.cfg.category, p.symbol, close_side, format(sl.qty.normalize(), "f"),
                                       fmt_price(float(sl.price), tick), p.position_idx, link, True)
-        log.info("%s %s: тейк-профит qty=%s @ %s (недостающее до цели по позиции)", p.symbol, close_side,
+        log.info("%s %s: %s qty=%s @ %s", p.symbol, close_side, self.label,
                  format(sl.qty.normalize(), "f"), fmt_price(float(sl.price), tick))
+
+
+CLOSE_PREFIX = "m2p-cl-"
+
+
+class ClosePack(TakeProfitLadder):
+    """Пачка на закрытие: вся позиция сразу несколькими лимитками вплотную у лучшей цены; переставляется вслед за рынком."""
+
+    prefix = CLOSE_PREFIX
+    label = "закрытие пачкой"
+
+    def __init__(self, client: BybitClient, cfg: Config, instrument_fn, open_orders_fn, fee_fn=None):
+        super().__init__(client, cfg, instrument_fn, open_orders_fn, fee_fn)
+        self.replace_ticks = cfg.close_replace_ticks
+        self.actions_per_tick = cfg.close_actions_per_tick
+
+    def _anchor(self, p: PositionView, book: dict | None, need_gain: float) -> float:
+        if not book:
+            return p.mark_price
+        return book["asks"][0][0] if p.side == "Buy" else book["bids"][0][0]
+
+    def _slices(self, p: PositionView, book: dict | None, need_gain: float, inst: dict) -> list[Slice]:
+        return plan_close_pack(p.side, p.size, book, inst, self.cfg)
