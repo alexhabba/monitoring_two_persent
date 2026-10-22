@@ -1261,3 +1261,14 @@ def test_start_streams_logs_and_starts_both_streams_with_ladder_enabled(tmp_path
     with caplog.at_level("INFO"):
         bot.start_streams()
     assert started == ["pub", "priv"] and any("пачка на 1.3" in r.getMessage() for r in caplog.records)
+
+
+def test_ladder_is_cancelled_before_the_closing_engine_places_orders(tmp_path):
+    bot, fake = fast_bot(tmp_path)
+    bot.fast_tick()
+    assert fake.orders                                        # пачка стоит
+    seen = []
+    orig = bot.closer.close_all
+    bot.closer.close_all = lambda ps, books: (seen.append(len(fake.orders)), orig(ps, books))[1]
+    bot._close_all([lpos()], {"XUSDT": ladder_book(100.0)})
+    assert seen == [0]                                        # к моменту первого закрывающего ордера пачки уже нет

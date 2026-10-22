@@ -307,6 +307,9 @@ class Bot:
     def _close_all(self, positions: list[PositionView], books: dict[str, dict]) -> None:
         """Закрываем ВСЕ позиции сразу и параллельно; первыми — те, у кого прибыль за последние 1–2 мин выросла сильнее
         всего (импульс может откатиться, их выходим первыми)."""
+        if self.ladder is not None:
+            self._ladder_off = True
+            self.ladder.cancel_all()    # пачку тейк-профитов снимаем ДО первого закрывающего ордера (иначе reduce-only превысят позицию)
         now = time.monotonic()
         scored = sorted(((self._momentum(p, now), p) for p in positions), key=lambda t: -t[0])
         if len(scored) > 1:
