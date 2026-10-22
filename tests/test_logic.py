@@ -1100,8 +1100,8 @@ def ladder_book(mark=100.0):
             "asks": [(mark + 0.1 * i, 100.0 + 50 * (i % 3)) for i in range(1, 80)]}
 
 
-def test_ladder_prices_follow_needed_gain_and_coefficients_for_long_and_short():
-    c = cfg(tp_coefs=(1.0, 1.3), tp_max_orders=2, tp_book_fraction=0.2, tp_density_window_bps=1)
+def test_ladder_prices_follow_needed_gain_for_long_and_short():
+    c = cfg(tp_max_orders=2, tp_book_fraction=0.2, tp_density_window_bps=1)
     # лонг 100 шт, mark 100, не хватает 10 USDT -> движение цены 0.1 (+комиссия): уровни ~100.1 и ~100.13
     longs = plan_ladder("Buy", 100.0, 100.0, 10.0, ladder_book(100.0), LADDER_INSTR, c, maker_fee=0.0)
     assert longs and all(s.price > 100 for s in longs)
@@ -1114,7 +1114,7 @@ def test_ladder_prices_follow_needed_gain_and_coefficients_for_long_and_short():
 
 
 def test_ladder_density_limits_slice_to_book_fraction_and_spreads_over_levels():
-    c = cfg(tp_coefs=(1.0,), tp_max_orders=6, tp_book_fraction=0.2, tp_density_window_bps=30)
+    c = cfg(tp_max_orders=6, tp_book_fraction=0.2, tp_density_window_bps=30)
     book = ladder_book(100.0)
     out = plan_ladder("Buy", 300.0, 100.0, 15.0, book, LADDER_INSTR, c, maker_fee=0.0)
     assert len(out) > 1                                          # объём размазан по нескольким уровням стакана
@@ -1130,7 +1130,7 @@ def test_ladder_empty_when_goal_already_reached_or_no_size():
 
 
 def test_ladder_price_is_passive_never_inside_the_market():
-    c = cfg(tp_coefs=(1.0,))
+    c = cfg()
     out = plan_ladder("Buy", 100.0, 100.0, 0.001, ladder_book(100.0), LADDER_INSTR, c, maker_fee=0.0)   # цель почти достигнута
     assert out and all(s.price > _D("99.9") for s in out)        # выше лучшего бида — не пересекает рынок
 
@@ -1157,7 +1157,7 @@ class LadderFake:
 
 
 def make_ladder(fake, **kw):
-    c = cfg(tp_coefs=(1.0, 1.3), tp_max_orders=4, tp_book_fraction=0.3, tp_density_window_bps=20, **kw)
+    c = cfg(tp_max_orders=4, tp_book_fraction=0.3, tp_density_window_bps=20, **kw)
     return TakeProfitLadder(fake, c, lambda s: LADDER_INSTR, lambda: list(fake.orders.values()), lambda s: 0.0)
 
 
@@ -1236,3 +1236,28 @@ def test_fast_tick_cancels_ladder_when_goal_is_latched(tmp_path):
     bot.goal_latched = True
     bot.fast_tick()
     assert not fake.orders
+
+
+def test_ladder_is_a_tight_cluster_at_goal_coef_times_the_daily_goal(tmp_path):
+    """Цель 2% от базы 500 = 10 USDT, коэффициент 1.3 -> пачка на результате дня 13 USDT; результат пока 0 -> недостающее 13."""
+    bot, fake = fast_bot(tmp_path)
+    bot.cfg = cfg(target_profit_pct=2.0, tp_goal_coef=1.3, tp_max_orders=4, tp_book_fraction=0.3, tp_density_window_bps=20)
+    bot.ladder.cfg = bot.cfg
+    bot.fast_tick()
+    prices = sorted(float(o["price"]) for o in fake.orders.values())
+    assert len(prices) >= 2                                   # пачка из нескольких лимиток, а не одна заявка
+    assert prices[0] >= 100.13 - 1e-9                         # первая — на уровне 1.3 x цели (13 USDT / 100 шт = 0.13)
+    assert prices[-1] - prices[0] <= 0.5                      # все вплотную друг к другу
+    assert sum(float(o["qty"]) for o in fake.orders.values()) == 100.0
+
+
+def test_start_streams_logs_and_starts_both_streams_with_ladder_enabled(tmp_path, caplog):
+    cl = FakeClient(legs={0: ["Buy", 0.0, 100.0]})
+    bot, store, clock = make_bot(cl, tmp_path, use_websocket=True, tp_ladder=True)
+    assert bot.pub is not None and bot.priv is not None and bot.ladder is not None
+    started = []
+    bot.pub.start = lambda: started.append("pub")
+    bot.priv.start = lambda: started.append("priv")
+    with caplog.at_level("INFO"):
+        bot.start_streams()
+    assert started == ["pub", "priv"] and any("пачка на 1.3" in r.getMessage() for r in caplog.records)

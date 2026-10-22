@@ -1,10 +1,10 @@
 """Лесенка тейк-профитов: заранее выставленные лимитки на закрытие по цене, при которой счёт достигнет цели дня.
 
-Для каждой открытой позиции считается, куда должна «выстрелить» цена, чтобы результат дня достиг цели (остальные позиции
-считаем неподвижными). Лимитки стоят в стакане ЗАРАНЕЕ, поэтому при резком импульсе биржа исполняет их сама, без задержки
-на опрос и реакцию бота. Уровней несколько (коэффициенты `TP_COEFS`, по умолчанию 1.0 и 1.3 — «во сколько раз дальше от цены,
-нужной для цели»), а объём раскладывается по стакану пропорционально плотности заявок рядом с каждым уровнем, чтобы мы не
-выделялись крупной заявкой.
+Для каждой открытой позиции считается, куда должна «выстрелить» цена, чтобы результат дня достиг `TP_GOAL_COEF` × цели дня
+(по умолчанию 1.3: при цели 2% — результата 2.6%; остальные позиции считаем неподвижными). Лимитки стоят в стакане ЗАРАНЕЕ,
+поэтому при резком импульсе биржа исполняет их сама, без задержки на опрос и реакцию бота. Это ПАЧКА лимиток вплотную у этой
+цены (первая часть на самом уровне, остальные — рядом, выше): объём раскладывается по стакану пропорционально плотности
+заявок, чтобы мы не выделялись одной крупной заявкой.
 
 Это post-only reduce-only лимитки (мейкер, комиссия ниже, проскальзывания нет, открыть/перевернуть позицию не могут).
 Когда цель достигнута — лесенка снимается, дальше работает обычный механизм закрытия.
@@ -60,17 +60,14 @@ def plan_ladder(side: str, size: float, mark: float, need_gain: float, book: dic
     best_bid = book["bids"][0][0] if book else None
     best_ask = book["asks"][0][0] if book else None
 
-    anchors: list[tuple[float, Decimal]] = []
-    for c in cfg.tp_coefs:
-        raw = mark + (c * delta if long_ else -c * delta)
-        px = _round_price(raw, tick, up=long_)
-        if book:   # пассивность: продажа должна стоять выше лучшего бида, покупка — ниже лучшего аска
-            if long_ and px <= Decimal(repr(best_bid)):
-                px = Decimal(repr(best_bid)) + tick
-            if not long_ and px >= Decimal(repr(best_ask)):
-                px = Decimal(repr(best_ask)) - tick
-        if px > 0:
-            anchors.append((c, px))
+    raw = mark + (delta if long_ else -delta)
+    px = _round_price(raw, tick, up=long_)
+    if book:   # пассивность: продажа должна стоять выше лучшего бида, покупка — ниже лучшего аска
+        if long_ and px <= Decimal(repr(best_bid)):
+            px = Decimal(repr(best_bid)) + tick
+        if not long_ and px >= Decimal(repr(best_ask)):
+            px = Decimal(repr(best_ask)) - tick
+    anchors: list[tuple[float, Decimal]] = [(cfg.tp_goal_coef, px)] if px > 0 else []
     if not anchors:
         return []
 
@@ -218,7 +215,7 @@ class TakeProfitLadder:
         fee = self.fee(p.symbol)
         delta = (need_gain + fee * p.mark_price * p.size) / p.size if p.size > 0 else 0.0
         sign = 1 if p.side == "Buy" else -1
-        anchors = [p.mark_price + sign * c * delta for c in self.cfg.tp_coefs]
+        anchors = [p.mark_price + sign * delta]
         tol = float(tick) * self.cfg.tp_replace_ticks
         old = self._cache.get(p.key)
         if old and old[1] == p.size and len(old[0]) == len(anchors) and all(abs(a - b) <= tol for a, b in zip(anchors, old[0])):

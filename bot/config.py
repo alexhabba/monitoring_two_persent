@@ -64,7 +64,7 @@ class Config:
     stream_max_age_sec: float = 3.0      # данные старше — считаем устаревшими и идём в REST
     fast_tick_sec: float = 0.25          # частота быстрой проверки (цель по живым данным, лесенка)
     tp_ladder: bool = False              # заранее выставленные тейк-профиты на цену, где счёт достигнет цели
-    tp_coefs: tuple = (1.0, 1.3)         # уровни лесенки: во сколько раз дальше от цены, нужной для цели
+    tp_goal_coef: float = 1.3            # пачка тейк-профитов стоит там, где результат дня = коэффициент × цель дня
     tp_book_fraction: float = 0.2        # не больше этой доли видимой заявки стакана на одном уровне
     tp_density_window_bps: float = 20.0  # окно (б.п.) от уровня, где ищем плотность стакана
     tp_max_orders: int = 6               # не больше стольких тейк-профитов на одну позицию
@@ -126,7 +126,7 @@ class Config:
             stream_max_age_sec=_float("STREAM_MAX_AGE_SEC", 3.0),
             fast_tick_sec=_float("FAST_TICK_SEC", 0.25),
             tp_ladder=_bool("TP_LADDER", False),
-            tp_coefs=_floats("TP_COEFS", (1.0, 1.3)),
+            tp_goal_coef=_float("TP_GOAL_COEF", 1.3),
             tp_book_fraction=_float("TP_BOOK_FRACTION", 0.2),
             tp_density_window_bps=_float("TP_DENSITY_WINDOW_BPS", 20.0),
             tp_max_orders=int(_float("TP_MAX_ORDERS", 6)),
@@ -141,10 +141,8 @@ class Config:
         return cfg
 
     def validate(self) -> None:
-        if self.tp_ladder and not self.tp_coefs:
-            raise ValueError("TP_COEFS не должен быть пустым")
-        if any(c <= 0 for c in self.tp_coefs):
-            raise ValueError("TP_COEFS должны быть > 0")
+        if self.tp_goal_coef < 1:
+            raise ValueError("TP_GOAL_COEF должен быть >= 1 (пачка стоит не ближе цели дня)")
         if not 0 < self.book_fraction <= 1:
             raise ValueError("BOOK_FRACTION должен быть в (0, 1]")
         if self.target_profit_pct <= 0:

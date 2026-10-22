@@ -123,7 +123,7 @@ class Bot:
             self.pub.start()
             self.priv.start()
             log.info("WebSocket включён (стакан/позиции/исполнения), лесенка тейк-профитов: %s",
-                     f"вкл, коэффициенты {self.cfg.tp_coefs}" if self.ladder else "выкл")
+                     f"вкл, пачка на {self.cfg.tp_goal_coef}× цели дня" if self.ladder else "выкл")
 
     def stop_streams(self) -> None:
         for st in (self.pub, self.priv):
@@ -346,7 +346,8 @@ class Bot:
             return
         self._ladder_off = False
         books = {p.symbol: self.pub.book(p.symbol, cfg.stream_max_age_sec) for p in positions}
-        self.ladder.tick(positions, books, need)
+        # пачка стоит там, где результат дня = коэффициент × цель дня (а не на самой цели)
+        self.ladder.tick(positions, books, target_gain * cfg.tp_goal_coef - current)
 
     # ---------- цикл ----------
     def run(self, copier=None) -> None:
