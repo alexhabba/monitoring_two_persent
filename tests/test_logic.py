@@ -1343,3 +1343,78 @@ def test_goal_closes_every_position_with_a_pack_in_one_step_and_cancel_removes_i
     assert all(o["orderLinkId"].startswith(CLOSE_PREFIX) for o in cl.pk.values())
     bot.closer.cancel_all()                            # цель снята — пачка снимается
     assert not cl.pk
+
+
+# ---------- пачка без данных стакана и пачка копии ----------
+def test_ladder_beyond_the_visible_book_is_still_a_cluster_of_adjacent_ticks():
+    c = cfg(tp_max_orders=5, tp_density_window_bps=20)
+    short_book = {"bids": [(99.9, 500.0)], "asks": [(100.1, 100.0), (100.2, 100.0)]}      # стакан доходит только до 100.2
+    out = plan_ladder("Buy", 100.0, 100.0, 40.0, short_book, LADDER_INSTR, c, maker_fee=0.0)   # уровень далеко за стаканом
+    assert len(out) == 5 and sum(s.qty for s in out) == _D(100)          # пачка из нескольких лимиток, а не один ордер
+    prices = [s.price for s in out]
+    assert prices == sorted(prices) and prices[0] >= _D("100.2") and prices[-1] - prices[0] <= _D("1.5")
+    short = plan_ladder("Sell", 100.0, 100.0, 40.0, short_book, LADDER_INSTR, c, maker_fee=0.0)
+    assert len(short) == 5 and all(s.price < _D("99.9") for s in short)
+
+
+class CopyLadderFake(CopyFake):
+    """Копия с хранением ордеров пачки."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.tp = {}
+
+    def place_limit_order(self, c, s, side, qty, price, idx, link, reduce_only):
+        oid = super().place_limit_order(c, s, side, qty, price, idx, link, reduce_only)
+        if str(link).startswith("m2p-tp-"):
+            self.tp[oid] = {"orderId": oid, "symbol": s, "side": side, "qty": qty, "leavesQty": qty, "price": price,
+                            "positionIdx": idx, "orderLinkId": link, "reduceOnly": True}
+        return oid
+
+    def get_open_orders(self, c, s): return list(self.tp.values())
+
+    def amend_order(self, c, s, oid, price, qty): self.tp[oid].update(price=price, qty=qty, leavesQty=qty)
+
+    def cancel_order(self, c, s, oid):
+        self.tp.pop(oid, None)
+        super().cancel_order(c, s, oid)
+
+
+def ladder_follower(tmp_path, client):
+    f = make_follower(tmp_path, client, tp_ladder=True, tp_ladder_followers=True)
+    f.bot._day_row = f.store.get_day(f.bot.clock().date().isoformat())      # база 1000, цель 2% = 20, пачка на 1.3 x = 26
+    f.bot._last_realized = 0.0
+    return f
+
+
+MAIN10 = [PositionView("BTCUSDT", "Buy", 10.0, 100.0, 100.0, 0.0, 0, 1.0, leverage=5.0)]
+
+
+def test_follower_gets_its_own_take_profit_pack_when_synced(tmp_path):
+    cl = CopyLadderFake(equity=1000.0, size=100.0)        # на копии ровно столько, сколько нужно (10 x ×10)
+    f = ladder_follower(tmp_path, cl)
+    assert f.ladder is not None
+    f._sync(MAIN10, 100.0)
+    assert cl.tp and all(o["side"] == "Sell" for o in cl.tp.values())
+    assert abs(sum(float(o["qty"]) for o in cl.tp.values()) - 100.0) < 1e-6 and len(cl.tp) >= 2
+    assert min(float(o["price"]) for o in cl.tp.values()) > 100.0         # выше рынка (уровень 1.3 x цели копии)
+
+
+def test_follower_pack_is_skipped_for_a_position_the_sync_is_still_building(tmp_path):
+    cl = CopyLadderFake(equity=1000.0, size=40.0)         # нужно 100, есть 40: синхронизация докупает
+    f = ladder_follower(tmp_path, cl)
+    f._sync(MAIN10, 100.0)
+    assert cl.placed and not cl.tp                         # синхронизация работает, пачки на этой позиции нет
+
+
+def test_follower_take_profit_fill_triggers_goal_check_instead_of_rebuying(tmp_path):
+    cl = CopyLadderFake(equity=1000.0, size=100.0)
+    f = ladder_follower(tmp_path, cl)
+    steps = []
+    f.bot.step = lambda: steps.append(1)
+    f._sync(MAIN10, 100.0)                                # пачка выставлена
+    assert cl.tp
+    cl.size = 70.0                                         # тейк-профит исполнился: позиция уменьшилась без участия синхронизации
+    placed_before = len(cl.placed)
+    f._sync(MAIN10, 100.0)
+    assert steps == [1] and len(cl.placed) == placed_before       # проверили цель и НЕ докупили обратно

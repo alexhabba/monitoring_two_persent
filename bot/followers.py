@@ -23,6 +23,7 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 
 from .bybit_client import BybitClient, BybitError
+from .ladder import TakeProfitLadder
 from .closer import ChunkPlan, FINAL, _fmt, _floor_to_step, book_depth, fmt_price
 from . import logctx
 from .config import Config
@@ -188,6 +189,16 @@ class Follower:
         self._pause_until = 0.0
         self._detached_logged = False
         self.bot.closer.account = self.name      # метка счёта для строк лога из потоков закрытия
+        # пачка тейк-профитов копии (со своей целью); книги — из общего потока основного (book_fn), иначе REST
+        self.ladder = None
+        self.book_fn = None
+        self._tp_off = False
+        self._prev_sizes: dict[Key, float] = {}
+        self._prev_busy: set[Key] = set()
+        self._prev_tp: set[Key] = set()
+        if self.cfg.tp_ladder and self.cfg.tp_ladder_followers and not self.cfg.dry_run:
+            self.ladder = TakeProfitLadder(self.client, self.cfg, self.bot.closer.instrument,
+                                           lambda: self.client.get_open_orders(self.cfg.category, self.cfg.settle_coin))
         self.future: Future | None = None
 
     def busy(self) -> bool:
@@ -220,6 +231,7 @@ class Follower:
         if row and row["goal_reached"]:
             # собственная цель выполнена: копирование остановлено, закрываем всё, что есть
             self._cancel_all()
+            self._cancel_tp()
             interval = cfg.close_loop_sleep_sec if bot.closing and not cfg.dry_run else cfg.poll_interval_sec
             if mono - self._last_eval >= interval:
                 self._last_eval = mono
@@ -246,6 +258,10 @@ class Follower:
                 self._detached_logged = True
                 log.warning("Основной счёт достиг цели дня — копия отсоединена до 00:00: ничего не копирует, "
                             "закрывается только по своей цели")
+            if self.ladder is not None:
+                cur = [parse_position(r) for r in self.client.get_positions(cfg.category, cfg.settle_coin)]
+                if not self._tp_fill_detected(cur, set()):
+                    self._tp_tick(cur, set())
             return
         self._detached_logged = False
         self._sync(main_positions, main_equity)
@@ -280,11 +296,14 @@ class Follower:
         if self.ratio <= 0:
             return
         self._settle_pending()
-        current = {p.key: p.signed_size for p in
-                   (parse_position(r) for r in self.client.get_positions(cfg.category, cfg.settle_coin))}
+        cur_pos = [parse_position(r) for r in self.client.get_positions(cfg.category, cfg.settle_coin)]
+        if self.ladder is not None and self._tp_fill_detected(cur_pos, self._prev_busy):
+            return      # сработал тейк-профит копии: сначала проверяем цель (она, скорее всего, достигнута), не докупаем обратно
+        current = {p.key: p.signed_size for p in cur_pos}
         wanted = {p.key: p.signed_size * self.ratio for p in main_positions}
         leverage = {p.symbol: p.leverage for p in main_positions}
         books: dict[str, dict] = {}
+        busy: set[Key] = set()
         for key in sorted(set(current) | set(wanted)):
             symbol = key[0]
             try:
@@ -292,6 +311,8 @@ class Follower:
                 act = plan_action(wanted.get(key, 0.0), current.get(key, 0.0), Decimal(inst["qty_step"]),
                                   Decimal(str(inst["min_qty"])), cfg.copy_deadband_pct)
                 pend = self.pending.get(key)
+                if pend or act is not None:
+                    busy.add(key)           # синхронизация сейчас работает с этой позицией — пачка тейк-профитов на ней не стоит
                 if pend:
                     if act is None or (act.side, act.reduce_only) != (pend.side, pend.reduce_only):
                         self._cancel(key)   # ордер больше не нужен или стал неверным
@@ -309,6 +330,60 @@ class Follower:
                 log.warning("%s: %s", symbol, e)
             except Exception:
                 log.exception("%s: ошибка копирования", symbol)
+        self._prev_busy = set(busy)
+        if self.ladder is not None:
+            self._tp_tick(cur_pos, busy)
+
+    # ---------- пачка тейк-профитов копии ----------
+    def _tp_need(self, cur: list[PositionView]) -> float | None:
+        """Сколько USDT результату дня копии не хватает до коэффициент × цель (считаем по её базе и её сделкам)."""
+        row = self.bot._day_row
+        if row is None:
+            return None
+        gain = self.bot._last_realized + sum(p.unrealised_pnl for p in cur) - row["start_unrealised"]
+        return row["start_equity"] * self.cfg.target_profit_pct / 100 * self.cfg.tp_goal_coef - gain
+
+    def _tp_books(self, symbols) -> dict[str, dict | None]:
+        out: dict[str, dict | None] = {}
+        for s in symbols:
+            b = None
+            try:
+                b = self.book_fn(s) if self.book_fn else None
+                if b is None:
+                    b = self.client.get_orderbook(self.cfg.category, s, self.cfg.book_limit)
+            except Exception:  # noqa: BLE001
+                b = None
+            out[s] = b
+        return out
+
+    def _tp_tick(self, cur: list[PositionView], excluded: set[Key]) -> None:
+        need = self._tp_need(cur)
+        if need is None:
+            return
+        pos = [p for p in cur if p.key not in excluded]       # где синхронизация активна — пачка снята (иначе конфликт reduce-only)
+        self.ladder.tick(pos, self._tp_books({p.symbol for p in pos}), need)
+        self._prev_tp = {p.key for p in pos}
+        self._prev_sizes = {p.key: p.size for p in cur}
+        self._tp_off = False
+
+    def _cancel_tp(self) -> None:
+        if self.ladder is not None and not self._tp_off:
+            self._tp_off = True
+            self.ladder.cancel_all()
+            self._prev_tp = set()
+
+    def _tp_fill_detected(self, cur: list[PositionView], prev_busy: set[Key]) -> bool:
+        """Позиция уменьшилась там, где стояла пачка и синхронизация ничего не делала: сработал тейк-профит копии."""
+        hit = [p.key for p in cur if p.key in self._prev_tp and p.key not in prev_busy
+               and p.size < self._prev_sizes.get(p.key, 0) - 1e-12]
+        gone = [k for k in self._prev_tp if k not in prev_busy and k not in {p.key for p in cur}]
+        self._prev_sizes = {p.key: p.size for p in cur}
+        if not hit and not gone:
+            return False
+        log.warning("Сработал тейк-профит копии (%s) — проверяем цель дня", ", ".join(k[0] for k in hit + gone))
+        self._last_eval = time.monotonic()
+        self.bot.step()          # цель копии, скорее всего, достигнута: зафиксирует её и остановит копирование
+        return True
 
     def _place(self, key: Key, act: Action, plan: ChunkPlan, lev: float, cur: float, want: float) -> None:
         cfg, symbol = self.cfg, key[0]
@@ -401,6 +476,14 @@ class Copier:
         for f in self.followers:
             if not f.busy():
                 f.future = self.pool.submit(f.tick, raw, self._equity, self._margin, main_goal_today)
+
+    def attach_books(self, pub) -> None:
+        """Стаканы основного (публичный поток WebSocket) — и копиям: символы у них те же."""
+        def book(symbol):
+            pub.ensure([symbol])
+            return pub.book(symbol, self.cfg.stream_max_age_sec)
+        for f in self.followers:
+            f.book_fn = book
 
     def close(self) -> None:
         self.pool.shutdown(wait=True)

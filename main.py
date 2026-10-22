@@ -68,6 +68,8 @@ def main() -> None:
             install_account_filter()
             copier = Copier.from_config(client, cfg)
             bot.start_streams()
+            if copier is not None and bot.pub is not None:
+                copier.attach_books(bot.pub)
             bot.run(copier)
     except KeyboardInterrupt:
         logging.getLogger("main").info("Остановлено.")

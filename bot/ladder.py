@@ -94,7 +94,17 @@ def _cluster(long_: bool, total: Decimal, px: Decimal, book: dict | None, instru
     near = [(p, q * Decimal(str(fraction))) for p, q in levels if (px <= p <= lim if long_ else lim <= p <= px)]
     near.sort(key=lambda x: x[0], reverse=not long_)                  # ближе к рынку сначала
     if not near:
-        near = [(px, total)]                                          # стакан не доходит до уровня — один ордер на уровне
+        # стакан не доходит до уровня (данных о плотности нет): пачка на соседних шагах цены, поровну
+        tick = Decimal(str(instrument["tick_size"]))
+        n = max(1, slots)
+        span = max(n - 1, int(px * window / tick))                  # ширина пачки в шагах цены
+        gap = max(1, span // max(1, n - 1))
+        near = []
+        for i in range(n):
+            lvl = px + i * gap * tick if long_ else px - i * gap * tick
+            if lvl > 0:
+                near.append((lvl, total / n))
+        near = near or [(px, total)]
     pick = near[:slots] if nearest else sorted(near, key=lambda x: -x[1])[:slots]
     cap = sum(q for _, q in pick) or total
     out: dict[Decimal, Decimal] = {}

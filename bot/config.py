@@ -67,9 +67,10 @@ class Config:
     tp_goal_coef: float = 1.3            # пачка тейк-профитов стоит там, где результат дня = коэффициент × цель дня
     tp_book_fraction: float = 0.2        # не больше этой доли видимой заявки стакана на одном уровне
     tp_density_window_bps: float = 20.0  # окно (б.п.) от уровня, где ищем плотность стакана
+    tp_ladder_followers: bool = False    # пачка тейк-профитов и на копирующих счетах (каждая со своей целью)
     tp_max_orders: int = 6               # не больше стольких тейк-профитов на одну позицию
     tp_replace_ticks: int = 3            # переставляем ордер, только если уровень ушёл больше чем на N шагов цены
-    tp_actions_per_tick: int = 4         # не больше стольких операций с ордерами лесенки за тик на позицию
+    tp_actions_per_tick: int = 6         # не больше стольких операций с ордерами лесенки за тик на позицию
     # --- закрытие по цели пачкой (вся позиция сразу несколькими лимитками) ---
     close_pack: bool = False             # True: после цели ставим на закрытие сразу всю позицию пачкой, а не по куску за секунду
     close_pack_max_orders: int = 5       # не больше стольких ордеров на позицию
@@ -133,12 +134,13 @@ class Config:
             stream_max_age_sec=_float("STREAM_MAX_AGE_SEC", 3.0),
             fast_tick_sec=_float("FAST_TICK_SEC", 0.25),
             tp_ladder=_bool("TP_LADDER", False),
+            tp_ladder_followers=_bool("TP_LADDER_FOLLOWERS", False),
             tp_goal_coef=_float("TP_GOAL_COEF", 1.3),
             tp_book_fraction=_float("TP_BOOK_FRACTION", 0.2),
             tp_density_window_bps=_float("TP_DENSITY_WINDOW_BPS", 20.0),
             tp_max_orders=int(_float("TP_MAX_ORDERS", 6)),
             tp_replace_ticks=int(_float("TP_REPLACE_TICKS", 3)),
-            tp_actions_per_tick=int(_float("TP_ACTIONS_PER_TICK", 4)),
+            tp_actions_per_tick=int(_float("TP_ACTIONS_PER_TICK", 6)),
             close_pack=_bool("CLOSE_PACK", False),
             close_pack_max_orders=int(_float("CLOSE_PACK_MAX_ORDERS", 5)),
             close_pack_window_bps=_float("CLOSE_PACK_WINDOW_BPS", 15.0),
