@@ -418,7 +418,8 @@ class Bot:
                 if copier is not None and now - last_copy >= self.cfg.copy_tick_sec:
                     last_copy = now
                     try:
-                        copier.tick(self.store.has_goal_event(self.clock().date().isoformat()))
+                        day = self.clock().date().isoformat()
+                        copier.tick(self.store.has_goal_event(day), self.store.last_reset_ts(day))
                     except Exception:
                         log.exception("Ошибка копирования")
                 if self.pub is not None:

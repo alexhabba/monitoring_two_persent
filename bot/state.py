@@ -113,6 +113,11 @@ class StateStore:
             "COALESCE((SELECT MAX(id) FROM events WHERE day=? AND kind='cycle_reset'), 0) LIMIT 1",
             (day, day)).fetchone() is not None
 
+    def last_reset_ts(self, day: str) -> str | None:
+        """Когда цикл этого дня сбрасывали в последний раз (пауза после цели закончилась)."""
+        r = self.conn.execute("SELECT ts FROM events WHERE day=? AND kind='cycle_reset' ORDER BY id DESC LIMIT 1", (day,)).fetchone()
+        return r[0] if r else None
+
     def add_event(self, day: str, ts: str, kind: str, text: str) -> None:
         with self.conn:
             self.conn.execute("INSERT INTO events(ts,day,kind,text) VALUES(?,?,?,?)", (ts, day, kind, text))

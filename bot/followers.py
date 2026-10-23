@@ -18,6 +18,7 @@ import logging
 import re
 import threading
 import time
+from datetime import datetime
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from decimal import Decimal
@@ -208,12 +209,12 @@ class Follower:
 
     # ---------- вход ----------
     def tick(self, main_positions: list[PositionView], main_equity: float, main_margin: str,
-             main_goal_today: bool = False) -> None:
+             main_goal_today: bool = False, main_reset_ts: str | None = None) -> None:
         if time.monotonic() < self._pause_until:
             return
         logctx.set_account(self.name)
         try:
-            self._tick(main_positions, main_equity, main_margin, main_goal_today)
+            self._tick(main_positions, main_equity, main_margin, main_goal_today, main_reset_ts)
         except BybitError as e:
             if e.code == RATE_LIMIT_CODE:
                 self._pause_until = time.monotonic() + RATE_LIMIT_PAUSE_SEC
@@ -226,10 +227,13 @@ class Follower:
             logctx.set_account(None)
 
     def _tick(self, main_positions: list[PositionView], main_equity: float, main_margin: str,
-              main_goal_today: bool = False) -> None:
+              main_goal_today: bool = False, main_reset_ts: str | None = None) -> None:
         cfg, bot = self.cfg, self.bot
         mono = time.monotonic()
         row = self.store.get_day(bot.clock().date().isoformat())
+        if row and row["goal_reached"] and row.get("goal_ts") and main_reset_ts \
+                and datetime.fromisoformat(main_reset_ts) > datetime.fromisoformat(row["goal_ts"]):
+            bot.force_reset = True     # основной сбросил цель позже, чем копия достигла своей — сбрасываемся вместе с ним
         if row and row["goal_reached"]:
             # собственная цель выполнена: копирование остановлено, закрываем всё, что есть
             self._cancel_all()
@@ -441,7 +445,6 @@ class Copier:
         self.pool = ThreadPoolExecutor(max_workers=max(1, len(followers)), thread_name_prefix="copy")
         self._positions: list[PositionView] = []
         self._empty_ticks = 0
-        self._prev_main_goal = False
         self._equity = 0.0
         self._equity_at = 0.0
         self._margin = ""
@@ -457,7 +460,7 @@ class Copier:
                     " [DRY-RUN]" if cfg.dry_run else "")
         return cls(main_client, cfg, followers)
 
-    def tick(self, main_goal_today: bool = False) -> None:
+    def tick(self, main_goal_today: bool = False, main_reset_ts: str | None = None) -> None:
         try:
             raw = [parse_position(r) for r in self.main.get_positions(self.cfg.category, self.cfg.settle_coin)]
             if time.monotonic() - self._equity_at >= self.cfg.copy_ratio_refresh_sec or self._equity <= 0:
@@ -476,14 +479,9 @@ class Copier:
         else:
             self._empty_ticks = 0
         self._positions = raw
-        if self._prev_main_goal and not main_goal_today:      # основной сбросил цель — копии тоже (таймер по основному)
-            for f in self.followers:
-                f.bot.force_reset = True
-            log.warning("Пауза основного счёта закончилась — цели копий сбрасываются, копирование возобновляется")
-        self._prev_main_goal = main_goal_today
         for f in self.followers:
             if not f.busy():
-                f.future = self.pool.submit(f.tick, raw, self._equity, self._margin, main_goal_today)
+                f.future = self.pool.submit(f.tick, raw, self._equity, self._margin, main_goal_today, main_reset_ts)
 
     def attach_books(self, pub) -> None:
         """Стаканы основного (публичный поток WebSocket) — и копиям: символы у них те же."""

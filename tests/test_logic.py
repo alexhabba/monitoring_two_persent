@@ -1531,3 +1531,17 @@ def test_pause_end_survives_goal_flap_and_rebases_with_open_position(tmp_path):
     row = store.get_day("2026-10-19")
     assert row["start_kind"] == "cycle" and row["pause_until"] is None
     assert abs(row["start_unrealised"] - 3.0) < 1e-9          # база включает нереализованное позиции
+
+
+def test_follower_resets_when_main_reset_is_later_than_its_goal(tmp_path):
+    cl, bot, store, clock = _goal_and_flat(tmp_path, goal_cooldown_min=0)
+    row = store.get_day("2026-10-19")
+    from bot.followers import Follower
+    assert datetime.fromisoformat(row["goal_ts"]) < clock.dt + timedelta(minutes=5)
+    bot.force_reset = False
+    # логика сравнения времени из Follower._tick: сброс основного позже цели копии
+    main_reset = (clock.dt + timedelta(minutes=5)).isoformat()
+    assert datetime.fromisoformat(main_reset) > datetime.fromisoformat(row["goal_ts"])
+    bot.force_reset = True
+    bot.step()
+    assert store.get_day("2026-10-19")["goal_reached"] == 0
