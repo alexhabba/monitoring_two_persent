@@ -24,14 +24,14 @@ class DayPnlTracker:
     def __init__(self, client: BybitClient, cfg: Config):
         self.client = client
         self.cfg = cfg
-        self._day: str | None = None
+        self._day: tuple | None = None
         self._tx: dict[str, float] = {}
         self._last_ms = 0
         self._full_at = 0
 
     def realized(self, day: str, start_ms: int, now_ms: int) -> float:
-        if day != self._day:
-            self._day, self._tx, self._last_ms, self._full_at = day, {}, 0, 0
+        if (day, start_ms) != self._day:     # новый день или новый цикл (после паузы) — считаем с нуля
+            self._day, self._tx, self._last_ms, self._full_at = (day, start_ms), {}, 0, 0
         full = self._last_ms == 0 or now_ms - self._full_at > FULL_REFRESH_MS
         frm = start_ms if full else max(start_ms, self._last_ms - OVERLAP_MS)
         rows = self.client.get_transaction_log(

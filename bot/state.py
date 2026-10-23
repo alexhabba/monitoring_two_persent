@@ -87,14 +87,28 @@ class StateStore:
                 "UPDATE days SET goal_reached=0, goal_ts=NULL, goal_equity=NULL, goal_gain=NULL, goal_pct=NULL, "
                 "final_equity=NULL, final_gain=NULL, final_ts=NULL WHERE day=?", (day,))
 
+    def rebase_day(self, day: str, ts: str, equity: float, unrealised: float, target_pct: float) -> None:
+        """Новый цикл внутри дня: после паузы цель сбрасывается, база и отсчёт результата — с этого момента."""
+        with self.conn:
+            self.conn.execute(
+                "UPDATE days SET start_equity=?, start_unrealised=?, start_ts=?, start_kind='cycle', target_pct=?, "
+                "goal_reached=0, goal_ts=NULL, goal_equity=NULL, goal_gain=NULL, goal_pct=NULL, "
+                "final_equity=NULL, final_gain=NULL, final_ts=NULL WHERE day=?",
+                (equity, unrealised, ts, target_pct, day))
+            self.conn.execute("INSERT INTO events(ts,day,kind,text) VALUES(?,?,?,?)",
+                              (ts, day, "cycle_reset", f"пауза после цели закончилась: новая база {equity:.4f}"))
+
     def set_final(self, day: str, ts: str, equity: float, gain: float | None) -> None:
         with self.conn:
             self.conn.execute("UPDATE days SET final_equity=?, final_gain=?, final_ts=? WHERE day=?",
                               (equity, gain, ts, day))
 
     def has_goal_event(self, day: str) -> bool:
-        """Достигал ли бот цели в этот день (хоть раз) — копии после этого отсоединяются от основного до конца дня."""
-        return self.conn.execute("SELECT 1 FROM events WHERE day=? AND kind='goal' LIMIT 1", (day,)).fetchone() is not None
+        """Достигал ли бот цели в текущем цикле (после последнего сброса) — копии до сброса отсоединены от основного."""
+        return self.conn.execute(
+            "SELECT 1 FROM events WHERE day=? AND kind='goal' AND id > "
+            "COALESCE((SELECT MAX(id) FROM events WHERE day=? AND kind='cycle_reset'), 0) LIMIT 1",
+            (day, day)).fetchone() is not None
 
     def add_event(self, day: str, ts: str, kind: str, text: str) -> None:
         with self.conn:

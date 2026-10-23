@@ -6,7 +6,7 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from .bybit_client import BybitClient
 from .closer import PositionCloser
@@ -232,8 +232,8 @@ class Bot:
             self.store.add_event(day["day"], now.isoformat(), "goal",
                                  f"цель достигнута: {ev.gain:+.4f} USDT = {ev.pct:.3f}% от базы {ev.start_equity:.4f}")
             log.warning("ЦЕЛЬ ДНЯ ДОСТИГНУТА: результат %+.4f USDT = %.3f%% >= %.2f%% (база %.4f). "
-                        "Записано в БД. Закрываем все позиции и все новые до конца дня.%s",
-                        ev.gain, ev.pct, cfg.target_profit_pct, ev.start_equity,
+                        "Записано в БД. Закрываем все позиции и все новые на %.0f мин.%s",
+                        ev.gain, ev.pct, cfg.target_profit_pct, ev.start_equity, cfg.goal_cooldown_min,
                         " [DRY-RUN: ордера не отправляются]" if cfg.dry_run else "")
         ev.goal = goal
         self.goal_latched = goal
@@ -273,6 +273,12 @@ class Bot:
             ev.goal = False
             return ev
         ev.goal = True
+        if not positions and self._cooldown_over(row, now):
+            if self._pending_final:
+                self._record_final(row, now)
+            self._reset_cycle(row, now)
+            ev.goal = False
+            return ev
         if positions:
             self.closing = True
             self._pending_final = True
@@ -286,9 +292,30 @@ class Bot:
         if self._pending_final:
             self._record_final(row, now)
         else:
-            log.info("%s | цель дня выполнена (%+.4f = %.3f%%), позиций нет — ждём до 00:00",
-                     row["day"], ev.gain, ev.pct)
+            log.info("%s | цель выполнена (%+.4f = %.3f%%), позиций нет — пауза до %s",
+                     row["day"], ev.gain, ev.pct, self._cooldown_end(row).strftime("%H:%M"))
         return ev
+
+    def _cooldown_end(self, row: dict) -> datetime:
+        goal_ts = datetime.fromisoformat(row["goal_ts"])
+        return goal_ts + timedelta(minutes=self.cfg.goal_cooldown_min)
+
+    def _cooldown_over(self, row: dict, now: datetime) -> bool:
+        """Пауза после цели прошла (сброс только когда всё закрыто). 0 = пауза до 00:00, как раньше."""
+        return (self.cfg.goal_cooldown_min > 0 and bool(row.get("goal_ts")) and now >= self._cooldown_end(row))
+
+    def _reset_cycle(self, row: dict, now: datetime) -> None:
+        """Цель сбрасывается: новая база = текущий баланс, результат считается с этого момента, торговля снова разрешена."""
+        equity = self.client.get_equity(self.cfg.account_type)
+        self.store.rebase_day(row["day"], now.isoformat(), equity, 0.0, self.cfg.target_profit_pct)
+        self._day_row = self.store.get_day(row["day"])
+        self._last_realized = 0.0
+        self.goal_latched = False
+        self.closing = False
+        self._pending_final = False
+        log.warning("%s | ПАУЗА %.0f мин после цели закончилась — цель сброшена, новая база %.4f USDT, "
+                    "снова ищем +%.2f%% (торговля разрешена)",
+                    row["day"], self.cfg.goal_cooldown_min, equity, self.cfg.target_profit_pct)
 
     def _record_final(self, row: dict, now: datetime) -> None:
         equity = self.client.get_equity(self.cfg.account_type)

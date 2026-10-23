@@ -47,6 +47,7 @@ class Config:
     category: str = "linear"
     settle_coin: str = "USDT"
     target_profit_pct: float = 2.0
+    goal_cooldown_min: float = 90.0      # через столько минут после достижения цели она сбрасывается и торговля возобновляется (0 = до 00:00)
     timezone: str = "Europe/Moscow"
     data_dir: str = "data"
     log_dir: str = "logs"
@@ -115,6 +116,7 @@ class Config:
             category=_str("CATEGORY", "linear"),
             settle_coin=_str("SETTLE_COIN", "USDT"),
             target_profit_pct=_float("TARGET_PROFIT_PCT", 2.0),
+            goal_cooldown_min=_float("GOAL_COOLDOWN_MIN", 90.0),
             timezone=_str("TIMEZONE", "Europe/Moscow"),
             data_dir=_str("DATA_DIR", "data"),
             log_dir=_str("LOG_DIR", "logs"),
