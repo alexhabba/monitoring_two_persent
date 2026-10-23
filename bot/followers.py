@@ -189,6 +189,7 @@ class Follower:
         self._margin_checked = False
         self._pause_until = 0.0
         self._detached_logged = False
+        self.bot.closer.trickle = cfg.trickle_market   # только копии: основной счёт рынком не сбрасываем
         self.bot.closer.account = self.name      # метка счёта для строк лога из потоков закрытия
         # пачка тейк-профитов копии (со своей целью); книги — из общего потока основного (book_fn), иначе REST
         self.ladder = None

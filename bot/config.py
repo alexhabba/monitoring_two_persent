@@ -80,6 +80,9 @@ class Config:
     close_replace_ticks: int = 1         # переставляем, когда лучшая цена ушла больше чем на N шагов
     close_actions_per_tick: int = 6      # не больше стольких операций с ордерами за тик на позицию
     close_workers: int = 8               # сколько позиций закрываем параллельно
+    trickle_market: bool = False         # копии: при закрытии помимо лимиток понемногу сбрасываем по рынку (reduce-only)
+    trickle_fraction: float = 0.02       # размер одной рыночной порции — доля глубины стакана в BOOK_DEPTH_BPS
+    trickle_interval_sec: float = 5.0    # не чаще одной порции на позицию за столько секунд
     momentum_windows_sec: tuple = (60.0, 120.0)   # окна для приоритета: у кого прибыль выросла сильнее — закрываем первой
     # --- копирование позиций на другие счета ---
     followers_file: str = ""            # JSON со списком счетов; пусто = {data_dir}/followers.json
@@ -149,6 +152,9 @@ class Config:
             close_pack_fraction=_float("CLOSE_PACK_FRACTION", 0.3),
             close_replace_ticks=int(_float("CLOSE_REPLACE_TICKS", 1)),
             close_actions_per_tick=int(_float("CLOSE_ACTIONS_PER_TICK", 6)),
+            trickle_market=_bool("TRICKLE_MARKET", False),
+            trickle_fraction=_float("TRICKLE_FRACTION", 0.02),
+            trickle_interval_sec=_float("TRICKLE_INTERVAL_SEC", 5.0),
             copy_deadband_pct=_float("COPY_DEADBAND_PCT", 3.0),
             ui_password=_str("UI_PASSWORD", ""),
             ui_host=_str("UI_HOST", "127.0.0.1"),
@@ -162,5 +168,7 @@ class Config:
             raise ValueError("TP_GOAL_COEF должен быть >= 1 (пачка стоит не ближе цели дня)")
         if not 0 < self.book_fraction <= 1:
             raise ValueError("BOOK_FRACTION должен быть в (0, 1]")
+        if not 0 < self.trickle_fraction <= 0.2:
+            raise ValueError("TRICKLE_FRACTION должен быть в (0, 0.2]: рыночные порции обязаны быть маленькими")
         if self.target_profit_pct <= 0:
             raise ValueError("TARGET_PROFIT_PCT должен быть > 0")

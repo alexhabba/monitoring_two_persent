@@ -98,6 +98,26 @@ def plan_chunk(p: PositionView, book: dict, instrument: dict, cfg: Config,
     return ChunkPlan(side=p.close_side, qty=qty, price=price)
 
 
+def plan_trickle(p: PositionView, book: dict, instrument: dict, cfg: Config) -> Decimal | None:
+    """Маленькая рыночная порция: доля глубины стакана рядом с ценой. None — слишком мало места или широкий спред."""
+    if not book["bids"] or not book["asks"]:
+        return None
+    bid, ask = best_prices(book)
+    if (ask - bid) / ((ask + bid) / 2) * 10_000 > cfg.max_spread_bps:
+        return None
+    step = Decimal(instrument["qty_step"])
+    min_qty = Decimal(str(instrument["min_qty"]))
+    depth = book_depth(book, p.close_side, cfg.book_depth_bps)
+    qty = _floor_to_step(Decimal(str(depth * cfg.trickle_fraction)), step)
+    if qty < min_qty:                       # минимальный лот крупнее «маленькой» порции — рынком не бьём, остаётся лимитка
+        return None
+    remaining = Decimal(str(p.size))
+    qty = min(qty, remaining)
+    if remaining - qty < min_qty:           # остаток после порции не закрыть — пусть закроют лимитки
+        return None
+    return qty
+
+
 def fmt_price(price: float, tick: str) -> str:
     """Цена строкой, кратной шагу цены монеты (без хвостов плавающей точки вроде 99.89999999999999)."""
     t = Decimal(str(tick))
@@ -124,6 +144,8 @@ class PositionCloser:
         self.account: str | None = None      # имя копирующего счёта — для меток в логе
         self.open_orders_fn = None           # () -> активные ордера (поток WebSocket, если есть); иначе REST
         self._pack = None
+        self.trickle = False                 # копии: маленькие рыночные порции поверх лимиток
+        self._trickle_at: dict[Key, float] = {}
 
     def instrument(self, symbol: str) -> dict:
         if symbol not in self._instruments:
@@ -175,6 +197,7 @@ class PositionCloser:
             return
         if cfg.close_pack and not cfg.dry_run:
             self._close_pack(positions, books)
+            self._trickle_all(positions, books)
             return
         fractions = self._hedge_fractions(positions, books)
         if cfg.dry_run:
@@ -191,12 +214,46 @@ class PositionCloser:
         if workers == 1:
             for p in positions:
                 self._safe_work(p, books[p.symbol], fractions.get(p.key))
+            self._trickle_all(positions, books)
             return
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="close",
                                 initializer=logctx.set_account, initargs=(self.account,)) as ex:
             futs = [ex.submit(self._safe_work, p, books[p.symbol], fractions.get(p.key)) for p in positions]
             for f in futs:
                 f.result()
+        self._trickle_all(positions, books)
+
+    def _trickle_all(self, positions: list[PositionView], books: dict[str, dict]) -> None:
+        """Копии: пока стоят лимитки, раз в несколько секунд сбрасываем по рынку крошечную порцию (reduce-only),
+        чтобы цену не двигать, но позиция уходила быстрее, чем ждать исполнения лимиток."""
+        cfg = self.cfg
+        if not self.trickle or cfg.dry_run:
+            return
+        now = time.monotonic()
+        for k in [k for k in self._trickle_at if k not in {p.key for p in positions}]:
+            del self._trickle_at[k]
+        for p in positions:
+            if now - self._trickle_at.get(p.key, -1e9) < cfg.trickle_interval_sec:
+                continue
+            book = books.get(p.symbol)
+            if book is None:
+                continue
+            try:
+                qty = plan_trickle(p, book, self.instrument(p.symbol), cfg)
+                if qty is None:
+                    continue
+                self._trickle_at[p.key] = now
+                self._seq += 1
+                self.client.place_market_close(cfg.category, p.symbol, p.close_side, _fmt(qty), p.position_idx,
+                                               f"m2p-mkt-{int(time.time())}-{self._seq}")
+                log.info("%s %s: рынком %s (остаток %s)", p.symbol, p.close_side, _fmt(qty), p.size)
+            except BybitError as e:
+                self._trickle_at[p.key] = now
+                if now - self._err_at.get(p.symbol, -1e9) >= ERR_LOG_EVERY_SEC:
+                    self._err_at[p.symbol] = now
+                    log.error("%s: рыночная порция не прошла — %s", p.symbol, e)
+            except Exception:
+                log.exception("Ошибка рыночной порции %s", p.symbol)
 
     def _close_pack(self, positions: list[PositionView], books: dict[str, dict]) -> None:
         """Вся позиция сразу пачкой лимиток у лучшей цены (первая часть на самой цене), переставляем вслед за рынком."""

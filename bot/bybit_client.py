@@ -193,6 +193,12 @@ class BybitClient:
         """Post-only reduce-only лимитка: гарантированно мейкер и не может открыть позицию."""
         return self.place_limit_order(category, symbol, side, qty, price, position_idx, link_id, True)
 
+    def place_market_close(self, category: str, symbol: str, side: str, qty: str, position_idx: int, link_id: str) -> str:
+        """Рыночная reduce-only заявка (тейкер): не может открыть или перевернуть позицию."""
+        body = {"category": category, "symbol": symbol, "side": side, "orderType": "Market", "qty": qty,
+                "positionIdx": position_idx, "orderLinkId": link_id, "reduceOnly": True}
+        return self._request("POST", "/v5/order/create", body=body)["orderId"]
+
     def set_leverage(self, category: str, symbol: str, leverage: float) -> None:
         lev = format(leverage, "g")
         try:

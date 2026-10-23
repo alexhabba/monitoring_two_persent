@@ -1463,3 +1463,36 @@ def test_follower_has_no_own_timer_resets_only_on_signal(tmp_path):
     bot.force_reset = True                                         # основной сбросил цель
     bot.step()
     assert store.get_day("2026-10-19")["goal_reached"] == 0
+
+
+# ---------- копии: маленькие рыночные порции поверх лимиток ----------
+def test_trickle_is_small_fraction_of_depth():
+    from bot.closer import plan_trickle
+    c = cfg(trickle_fraction=0.02)
+    q = plan_trickle(pos(size=100.0), make_book(), INSTR, c)
+    assert q is not None and 0 < float(q) <= 10.0 * 0.02 + 1e-9        # не больше 2% глубины (10)
+
+
+def test_trickle_skips_wide_spread_and_dust():
+    from bot.closer import plan_trickle
+    wide = {"bids": [(100.0, 5.0)], "asks": [(101.0, 5.0)]}
+    assert plan_trickle(pos(size=100.0), wide, INSTR, cfg()) is None
+    assert plan_trickle(pos(size=0.2), make_book(), INSTR, cfg()) is None   # остаток после порции меньше лота
+
+
+def test_trickle_market_sent_only_when_enabled_and_throttled(tmp_path):
+    class Cl(FakeClient):
+        def __init__(self): super().__init__(); self.mkt = []
+        def place_market_close(self, c, s, side, qty, idx, link): self.mkt.append((side, qty, link))
+    cl = Cl()
+    cl.clock = Clock(datetime(2026, 10, 19, 14, 0, tzinfo=MSK))
+    c = cfg(close_pack=False)
+    cl_closer = PositionCloser(cl, c, sleep=lambda s: None)
+    p = pos(size=100.0)
+    cl_closer.close_all([p], {p.symbol: make_book()})
+    assert cl.mkt == []                                   # у основного счёта рынка нет
+    cl_closer.trickle = True
+    cl_closer.close_all([p], {p.symbol: make_book()})
+    assert len(cl.mkt) == 1 and cl.mkt[0][0] == "Sell"
+    cl_closer.close_all([p], {p.symbol: make_book()})
+    assert len(cl.mkt) == 1                               # не чаще, чем раз в trickle_interval_sec
