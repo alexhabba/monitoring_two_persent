@@ -1269,7 +1269,7 @@ def test_ladder_is_cancelled_before_the_closing_engine_places_orders(tmp_path):
     assert fake.orders                                        # пачка стоит
     seen = []
     orig = bot.closer.close_all
-    bot.closer.close_all = lambda ps, books: (seen.append(len(fake.orders)), orig(ps, books))[1]
+    bot.closer.close_all = lambda ps, books, *a: (seen.append(len(fake.orders)), orig(ps, books, *a))[1]
     bot._close_all([lpos()], {"XUSDT": ladder_book(100.0)})
     assert seen == [0]                                        # к моменту первого закрывающего ордера пачки уже нет
 
