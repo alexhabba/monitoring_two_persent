@@ -248,7 +248,7 @@ class Bot:
 
         if goal and positions:
             self._pending_final = True
-            self._close_all(positions, books)
+            self._close_all(positions, books, ev.pct >= cfg.target_profit_pct)
         return ev
 
     def _goal_step(self, row: dict, now: datetime) -> Evaluation:
@@ -288,7 +288,7 @@ class Bot:
                 self._goal_log_at = time.monotonic()
                 log.info("%s | цель дня выполнена (результат %+.4f = %.3f%% >= %.2f%%) — закрываем позиции (%d)",
                          row["day"], ev.gain, ev.pct, cfg.target_profit_pct, len(positions))
-            self._close_all(positions, books)
+            self._close_all(positions, books, ev.pct >= cfg.target_profit_pct)
             return ev
         self.closing = False
         if self._pending_final:
@@ -338,7 +338,7 @@ class Bot:
                     txt, self.cfg.target_profit_pct, equity)
         self._pending_final = False
 
-    def _close_all(self, positions: list[PositionView], books: dict[str, dict]) -> None:
+    def _close_all(self, positions: list[PositionView], books: dict[str, dict], allow_market: bool = False) -> None:
         """Закрываем ВСЕ позиции сразу и параллельно; первыми — те, у кого прибыль за последние 1–2 мин выросла сильнее
         всего (импульс может откатиться, их выходим первыми)."""
         if self.ladder is not None:
@@ -353,7 +353,7 @@ class Bot:
                 log.info("Приоритет закрытия (рост прибыли за 1–2 мин): %s",
                          ", ".join(f"{p.symbol} {m:+.2f}" for m, p in scored[:6]))
         try:
-            self.closer.close_all([p for _, p in scored], books)
+            self.closer.close_all([p for _, p in scored], books, allow_market)
         except Exception:  # одна неудачная лимитка не должна ронять бота
             log.exception("Ошибка при закрытии позиций")
 

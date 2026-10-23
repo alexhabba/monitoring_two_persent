@@ -1496,3 +1496,18 @@ def test_trickle_market_sent_only_when_enabled_and_throttled(tmp_path):
     assert len(cl.mkt) == 1 and cl.mkt[0][0] == "Sell"
     cl_closer.close_all([p], {p.symbol: make_book()})
     assert len(cl.mkt) == 1                               # не чаще, чем раз в trickle_interval_sec
+
+
+def test_trickle_market_only_while_result_not_below_target(tmp_path):
+    class Cl(FakeClient):
+        def __init__(self): super().__init__(); self.mkt = []
+        def place_market_close(self, c, s, side, qty, idx, link): self.mkt.append(qty)
+    cl = Cl()
+    cl.clock = Clock(datetime(2026, 10, 19, 14, 0, tzinfo=MSK))
+    closer = PositionCloser(cl, cfg(trickle_interval_sec=0.0), sleep=lambda s: None)
+    closer.trickle = True
+    p = pos(size=100.0)
+    closer.close_all([p], {p.symbol: make_book()}, allow_market=False)
+    assert cl.mkt == []
+    closer.close_all([p], {p.symbol: make_book()}, allow_market=True)
+    assert len(cl.mkt) == 1

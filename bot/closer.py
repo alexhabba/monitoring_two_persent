@@ -185,7 +185,7 @@ class PositionCloser:
         return filled
 
     # ---------- непрерывное закрытие: все позиции сразу, проверка каждую секунду ----------
-    def close_all(self, positions: list[PositionView], books: dict[str, dict]) -> None:
+    def close_all(self, positions: list[PositionView], books: dict[str, dict], allow_market: bool = True) -> None:
         """Один «тик» закрытия (вызывается раз в секунду). positions — уже по приоритету (первые — важнее).
 
         По каждой позиции параллельно: нет живого ордера — ставим post-only reduce-only лимитку на лучшую цену своей стороны;
@@ -197,7 +197,7 @@ class PositionCloser:
             return
         if cfg.close_pack and not cfg.dry_run:
             self._close_pack(positions, books)
-            self._trickle_all(positions, books)
+            self._trickle_all(positions, books, allow_market)
             return
         fractions = self._hedge_fractions(positions, books)
         if cfg.dry_run:
@@ -214,20 +214,20 @@ class PositionCloser:
         if workers == 1:
             for p in positions:
                 self._safe_work(p, books[p.symbol], fractions.get(p.key))
-            self._trickle_all(positions, books)
+            self._trickle_all(positions, books, allow_market)
             return
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="close",
                                 initializer=logctx.set_account, initargs=(self.account,)) as ex:
             futs = [ex.submit(self._safe_work, p, books[p.symbol], fractions.get(p.key)) for p in positions]
             for f in futs:
                 f.result()
-        self._trickle_all(positions, books)
+        self._trickle_all(positions, books, allow_market)
 
-    def _trickle_all(self, positions: list[PositionView], books: dict[str, dict]) -> None:
+    def _trickle_all(self, positions: list[PositionView], books: dict[str, dict], allow_market: bool = True) -> None:
         """Копии: пока стоят лимитки, раз в несколько секунд сбрасываем по рынку крошечную порцию (reduce-only),
         чтобы цену не двигать, но позиция уходила быстрее, чем ждать исполнения лимиток."""
         cfg = self.cfg
-        if not self.trickle or cfg.dry_run:
+        if not self.trickle or cfg.dry_run or not allow_market:   # рынок — только пока результат не ниже цели
             return
         now = time.monotonic()
         for k in [k for k in self._trickle_at if k not in {p.key for p in positions}]:
