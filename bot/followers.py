@@ -170,7 +170,8 @@ class Follower:
         self.spec = spec
         self.name = spec.name
         self.cfg = replace(cfg, api_key=spec.api_key, api_secret=spec.api_secret, testnet=spec.testnet,
-                           base_url=spec.base_url, dry_run=cfg.dry_run or spec.dry_run)
+                           base_url=spec.base_url, dry_run=cfg.dry_run or spec.dry_run,
+                           goal_cooldown_min=0)   # таймер один — у основного счёта; копия сбрасывается по его сигналу
         self.client = client or BybitClient(spec.api_key, spec.api_secret, spec.testnet, spec.base_url)
         net = "testnet" if spec.testnet else "mainnet"
         mode = "dry" if self.cfg.dry_run else "live"
@@ -439,6 +440,7 @@ class Copier:
         self.pool = ThreadPoolExecutor(max_workers=max(1, len(followers)), thread_name_prefix="copy")
         self._positions: list[PositionView] = []
         self._empty_ticks = 0
+        self._prev_main_goal = False
         self._equity = 0.0
         self._equity_at = 0.0
         self._margin = ""
@@ -473,6 +475,11 @@ class Copier:
         else:
             self._empty_ticks = 0
         self._positions = raw
+        if self._prev_main_goal and not main_goal_today:      # основной сбросил цель — копии тоже (таймер по основному)
+            for f in self.followers:
+                f.bot.force_reset = True
+            log.warning("Пауза основного счёта закончилась — цели копий сбрасываются, копирование возобновляется")
+        self._prev_main_goal = main_goal_today
         for f in self.followers:
             if not f.busy():
                 f.future = self.pool.submit(f.tick, raw, self._equity, self._margin, main_goal_today)

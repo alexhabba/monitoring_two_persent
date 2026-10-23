@@ -37,6 +37,7 @@ class Bot:
         self._hist: deque[tuple[float, dict[Key, float]]] = deque()   # (monotonic, {позиция: нереализованный PnL})
         self._pending_final = False  # закрывали позиции после цели — нужно записать итог дня
         self.closing = False
+        self.force_reset = False   # копия: сбросить цель по сигналу основного счёта (своего таймера у копии нет)
         # --- WebSocket и лесенка тейк-профитов (только основной счёт: live_data=False у копий) ---
         self.pub = self.priv = self.ladder = None
         if live_data:
@@ -218,6 +219,7 @@ class Bot:
         if row and row["goal_reached"]:
             return self._goal_step(row, now)   # цель уже в БД — лог транзакций и баланс больше не запрашиваем
 
+        self.force_reset = False
         equity = self.client.get_equity(cfg.account_type)
         positions = [parse_position(r) for r in self.client.get_positions(cfg.category, cfg.settle_coin)]
         self._remember(positions)
@@ -302,6 +304,8 @@ class Bot:
 
     def _cooldown_over(self, row: dict, now: datetime) -> bool:
         """Пауза после цели прошла (сброс только когда всё закрыто). 0 = пауза до 00:00, как раньше."""
+        if self.force_reset:
+            return True
         return (self.cfg.goal_cooldown_min > 0 and bool(row.get("goal_ts")) and now >= self._cooldown_end(row))
 
     def _reset_cycle(self, row: dict, now: datetime) -> None:
@@ -313,6 +317,7 @@ class Bot:
         self.goal_latched = False
         self.closing = False
         self._pending_final = False
+        self.force_reset = False
         log.warning("%s | ПАУЗА %.0f мин после цели закончилась — цель сброшена, новая база %.4f USDT, "
                     "снова ищем +%.2f%% (торговля разрешена)",
                     row["day"], self.cfg.goal_cooldown_min, equity, self.cfg.target_profit_pct)

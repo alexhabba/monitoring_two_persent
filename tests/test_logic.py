@@ -1418,3 +1418,48 @@ def test_follower_take_profit_fill_triggers_goal_check_instead_of_rebuying(tmp_p
     placed_before = len(cl.placed)
     f._sync(MAIN10, 100.0)
     assert steps == [1] and len(cl.placed) == placed_before       # проверили цель и НЕ докупили обратно
+
+
+# ---------- пауза после цели: через GOAL_COOLDOWN_MIN цель сбрасывается ----------
+def _goal_and_flat(tmp_path, **kw):
+    cl = FakeClient()
+    bot, store, clock = make_bot(cl, tmp_path, **kw)
+    bot.step()
+    cl.mark = 104.0
+    for _ in range(15):
+        bot.step()
+        if all(l[1] <= 1e-9 for l in cl.legs.values()):
+            break
+    bot.step()
+    assert store.get_day("2026-10-19")["goal_reached"] == 1
+    return cl, bot, store, clock
+
+
+def test_goal_is_kept_during_cooldown(tmp_path):
+    cl, bot, store, clock = _goal_and_flat(tmp_path, goal_cooldown_min=90)
+    clock.advance(minutes=89)
+    bot.step()
+    assert store.get_day("2026-10-19")["goal_reached"] == 1
+    assert store.has_goal_event("2026-10-19")
+
+
+def test_goal_resets_after_cooldown_with_new_base(tmp_path):
+    cl, bot, store, clock = _goal_and_flat(tmp_path, goal_cooldown_min=90)
+    clock.advance(minutes=91)
+    bot.step()
+    row = store.get_day("2026-10-19")
+    assert row["goal_reached"] == 0 and row["start_kind"] == "cycle"
+    assert abs(row["start_equity"] - cl.get_equity("")) < 1e-9
+    assert not store.has_goal_event("2026-10-19")
+    bot.step()
+    assert store.get_day("2026-10-19")["goal_reached"] == 0
+
+
+def test_follower_has_no_own_timer_resets_only_on_signal(tmp_path):
+    cl, bot, store, clock = _goal_and_flat(tmp_path, goal_cooldown_min=0)
+    clock.advance(minutes=300)
+    bot.step()
+    assert store.get_day("2026-10-19")["goal_reached"] == 1       # своего таймера нет
+    bot.force_reset = True                                         # основной сбросил цель
+    bot.step()
+    assert store.get_day("2026-10-19")["goal_reached"] == 0
