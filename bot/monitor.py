@@ -224,13 +224,17 @@ class Bot:
         positions = [parse_position(r) for r in self.client.get_positions(cfg.category, cfg.settle_coin)]
         self._remember(positions)
         day = self._ensure_day(now, equity, sum(p.unrealised_pnl for p in positions))
+        if self._pause_over(day, now):     # пауза после цели прошла, хотя цель «мигнула» и не держится — всё равно новый цикл
+            self._reset_cycle(day, now, equity, sum(p.unrealised_pnl for p in positions))
+            day = self.store.get_day(day["day"])
 
         ev, books = self._evaluate(day, now, positions, equity)
         self._day_row, self._last_realized = day, ev.realized
 
         goal = ev.pct >= cfg.target_profit_pct
         if goal:
-            self.store.mark_goal(day["day"], now.isoformat(), equity, ev.gain, ev.pct)
+            pause = (now + timedelta(minutes=cfg.goal_cooldown_min)).isoformat() if cfg.goal_cooldown_min > 0 else None
+            self.store.mark_goal(day["day"], now.isoformat(), equity, ev.gain, ev.pct, pause)
             self.store.add_event(day["day"], now.isoformat(), "goal",
                                  f"цель достигнута: {ev.gain:+.4f} USDT = {ev.pct:.3f}% от базы {ev.start_equity:.4f}")
             log.warning("ЦЕЛЬ ДНЯ ДОСТИГНУТА: результат %+.4f USDT = %.3f%% >= %.2f%% (база %.4f). "
@@ -299,19 +303,25 @@ class Bot:
         return ev
 
     def _cooldown_end(self, row: dict) -> datetime:
-        goal_ts = datetime.fromisoformat(row["goal_ts"])
-        return goal_ts + timedelta(minutes=self.cfg.goal_cooldown_min)
+        if row.get("pause_until"):
+            return datetime.fromisoformat(row["pause_until"])
+        return datetime.fromisoformat(row["goal_ts"]) + timedelta(minutes=self.cfg.goal_cooldown_min)
+
+    def _pause_over(self, row: dict, now: datetime) -> bool:
+        return self.cfg.goal_cooldown_min > 0 and bool(row.get("pause_until")) and now >= self._cooldown_end(row)
 
     def _cooldown_over(self, row: dict, now: datetime) -> bool:
         """Пауза после цели прошла (сброс только когда всё закрыто). 0 = пауза до 00:00, как раньше."""
         if self.force_reset:
             return True
-        return (self.cfg.goal_cooldown_min > 0 and bool(row.get("goal_ts")) and now >= self._cooldown_end(row))
+        return (self.cfg.goal_cooldown_min > 0 and bool(row.get("goal_ts")) and now >= self._cooldown_end(row))   # 0 = пауза до 00:00
 
-    def _reset_cycle(self, row: dict, now: datetime) -> None:
-        """Цель сбрасывается: новая база = текущий баланс, результат считается с этого момента, торговля снова разрешена."""
-        equity = self.client.get_equity(self.cfg.account_type)
-        self.store.rebase_day(row["day"], now.isoformat(), equity, 0.0, self.cfg.target_profit_pct)
+    def _reset_cycle(self, row: dict, now: datetime, equity: float | None = None, unrealised: float = 0.0) -> None:
+        """Цель сбрасывается: новая база = текущий баланс, результат считается с этого момента, торговля снова разрешена.
+        Открытые позиции входят в базу своим нереализованным PnL — считается только их дальнейшее изменение."""
+        if equity is None:
+            equity = self.client.get_equity(self.cfg.account_type)
+        self.store.rebase_day(row["day"], now.isoformat(), equity, unrealised, self.cfg.target_profit_pct)
         self._day_row = self.store.get_day(row["day"])
         self._last_realized = 0.0
         self.goal_latched = False

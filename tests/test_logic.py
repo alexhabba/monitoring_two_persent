@@ -1511,3 +1511,23 @@ def test_trickle_market_only_while_result_not_below_target(tmp_path):
     assert cl.mkt == []
     closer.close_all([p], {p.symbol: make_book()}, allow_market=True)
     assert len(cl.mkt) == 1
+
+
+def test_pause_end_survives_goal_flap_and_rebases_with_open_position(tmp_path):
+    """Цель снялась (убыточная позиция в паузе) и сработала снова — срок паузы прежний; по его окончании база сбрасывается
+    вместе с нереализованным PnL открытой позиции, а не тянет старую реализованную прибыль."""
+    cl, bot, store, clock = _goal_and_flat(tmp_path, goal_cooldown_min=90)
+    t0 = store.get_day("2026-10-19")["pause_until"]
+    assert t0 is not None
+    store.clear_goal("2026-10-19")                           # цель «мигнула»
+    assert store.get_day("2026-10-19")["pause_until"] == t0
+    store.mark_goal("2026-10-19", clock.dt.isoformat(), 500.0, 10.0, 2.0, "later")   # повторно — срок не меняется
+    assert store.get_day("2026-10-19")["pause_until"] == t0
+    store.clear_goal("2026-10-19")
+    cl.legs = {0: ["Buy", 3.0, 100.0]}
+    cl.mark = 101.0                                          # открытая позиция с нереализованным +3
+    clock.advance(minutes=91)
+    bot.step()
+    row = store.get_day("2026-10-19")
+    assert row["start_kind"] == "cycle" and row["pause_until"] is None
+    assert abs(row["start_unrealised"] - 3.0) < 1e-9          # база включает нереализованное позиции

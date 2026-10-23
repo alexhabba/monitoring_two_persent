@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS days(
     final_ts       TEXT,
     start_unrealised REAL NOT NULL DEFAULT 0,  -- нереализованный PnL на начало дня
     goal_gain      REAL,               -- результат дня в USDT в момент цели
-    final_gain     REAL                -- результат дня в USDT после закрытия всего
+    final_gain     REAL,               -- результат дня в USDT после закрытия всего
+    pause_until    TEXT                -- когда закончится пауза после цели (не сбрасывается, если цель «мигнула»)
 );
 CREATE TABLE IF NOT EXISTS events(
     id   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,7 +46,7 @@ class StateStore:
 
     def _migrate(self) -> None:
         have = {r[1] for r in self.conn.execute("PRAGMA table_info(days)")}
-        for col, ddl in (("start_unrealised", "REAL NOT NULL DEFAULT 0"), ("goal_gain", "REAL"), ("final_gain", "REAL")):
+        for col, ddl in (("start_unrealised", "REAL NOT NULL DEFAULT 0"), ("goal_gain", "REAL"), ("final_gain", "REAL"), ("pause_until", "TEXT")):
             if col not in have:
                 self.conn.execute(f"ALTER TABLE days ADD COLUMN {col} {ddl}")
 
@@ -74,11 +75,13 @@ class StateStore:
                               (day, "reset", "день сброшен вручную"))
         return n > 0
 
-    def mark_goal(self, day: str, ts: str, equity: float, gain: float, pct: float) -> None:
+    def mark_goal(self, day: str, ts: str, equity: float, gain: float, pct: float,
+                  pause_until: str | None = None) -> None:
+        # pause_until ставится один раз за цикл: если цель снялась и достигнута снова, срок паузы прежний
         with self.conn:
             self.conn.execute(
-                "UPDATE days SET goal_reached=1, goal_ts=?, goal_equity=?, goal_gain=?, goal_pct=? WHERE day=?",
-                (ts, equity, gain, pct, day))
+                "UPDATE days SET goal_reached=1, goal_ts=?, goal_equity=?, goal_gain=?, goal_pct=?, "
+                "pause_until=COALESCE(pause_until, ?) WHERE day=?", (ts, equity, gain, pct, pause_until, day))
 
     def clear_goal(self, day: str) -> None:
         """Снять отметку «цель выполнена» (результат дня упал ниже цели до того, как всё закрыто)."""
@@ -93,7 +96,7 @@ class StateStore:
             self.conn.execute(
                 "UPDATE days SET start_equity=?, start_unrealised=?, start_ts=?, start_kind='cycle', target_pct=?, "
                 "goal_reached=0, goal_ts=NULL, goal_equity=NULL, goal_gain=NULL, goal_pct=NULL, "
-                "final_equity=NULL, final_gain=NULL, final_ts=NULL WHERE day=?",
+                "final_equity=NULL, final_gain=NULL, final_ts=NULL, pause_until=NULL WHERE day=?",
                 (equity, unrealised, ts, target_pct, day))
             self.conn.execute("INSERT INTO events(ts,day,kind,text) VALUES(?,?,?,?)",
                               (ts, day, "cycle_reset", f"пауза после цели закончилась: новая база {equity:.4f}"))
